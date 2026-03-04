@@ -1,0 +1,27 @@
+name: agentbench-fc
+services:
+  controller:
+    image: jingbh/agentrl-controller:latest
+    container_name: agentrl-controller
+    ports: ["5020:5020"]
+    command: ["controller"]
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports: ["6379:6379"]
+    # 关键：避免 docker volume + xattr copy
+    tmpfs:
+      - /data
+
+  os_interaction-std:
+    build:
+      context: ..
+      dockerfile: src/server/tasks/os_interaction/Dockerfile
+    command: ["--controller", "http://controller:5020/api", "os-std"]
+    depends_on: [controller, redis]
+    environment:
+      - OS_STD_PARAMETERS_ENV_OPTIONS_NETWORK_NAME=agentbench-fc_default
+    volumes:
+      # 关键：rootless docker.sock 挂进 worker 容器
+      - "${XDG_RUNTIME_DIR}/docker.sock:/var/run/docker.sock"
