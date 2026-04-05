@@ -57,6 +57,76 @@ _MUTATION_HINTS = (
     "pkill",
 )
 
+_VERIFICATION_HINTS = (
+    "ls",
+    "stat",
+    "test",
+    "grep",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "find",
+    "readlink",
+    "ps",
+    "systemctl",
+    "service",
+    "file",
+    "ss",
+    "netstat",
+)
+
+_COMMAND_STOPWORDS = {
+    "sudo",
+    "bash",
+    "sh",
+    "cat",
+    "grep",
+    "awk",
+    "sed",
+    "find",
+    "ls",
+    "head",
+    "tail",
+    "wc",
+    "stat",
+    "pwd",
+    "readlink",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "ps",
+    "env",
+    "which",
+    "whereis",
+    "file",
+    "printf",
+    "chmod",
+    "chown",
+    "touch",
+    "mkdir",
+    "rm",
+    "mv",
+    "cp",
+    "ln",
+    "tee",
+    "python",
+    "python3",
+    "perl",
+    "patch",
+    "git",
+    "tar",
+    "unzip",
+    "service",
+    "systemctl",
+    "kill",
+    "pkill",
+    "echo",
+    "true",
+    "false",
+}
+
 _ERROR_RULES = (
     ("permission", ("permission denied", "operation not permitted", "read-only file system")),
     ("missing_file", ("no such file", "cannot access", "not found")),
@@ -135,6 +205,42 @@ def _classify_command(command: str) -> str:
     if has_inspection:
         return "inspection"
     return "unknown"
+
+
+def _command_keywords(command: str) -> set[str]:
+    tokens = set(re.findall(r"[A-Za-z0-9_./:-]+", (command or "").lower()))
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and not token.startswith("-") and token not in _COMMAND_STOPWORDS
+    }
+
+
+def _get_latest_mutation_step(state: "TrajectoryState") -> Optional["StepRecord"]:
+    for record in reversed(state.recent_steps[:-1]):
+        if record.command_type in {"mutation", "mixed"}:
+            return record
+    return None
+
+
+def _looks_like_verification_command(command: str) -> bool:
+    lowered = normalize_command(command).lower()
+    return any(_has_shell_hint(lowered, hint) for hint in _VERIFICATION_HINTS)
+
+
+def _is_related_to_latest_mutation(command: str, state: "TrajectoryState") -> bool:
+    mutation_step = _get_latest_mutation_step(state)
+    if mutation_step is None:
+        return False
+
+    current_paths = set(_extract_paths(command))
+    mutation_paths = set(_extract_paths(mutation_step.command, mutation_step.output))
+    if current_paths and mutation_paths and current_paths.intersection(mutation_paths):
+        return True
+
+    current_keywords = _command_keywords(command)
+    mutation_keywords = _command_keywords(mutation_step.command + "\n" + mutation_step.output)
+    return bool(current_keywords and mutation_keywords and current_keywords.intersection(mutation_keywords))
 
 
 @dataclass
@@ -327,7 +433,14 @@ class OSMonitor:
             state.last_mutation_round = round_id
             state.last_verification_round = None
         elif command_type in {"inspection", "unknown"} and informative:
-            state.last_verification_round = round_id
+            if state.last_mutation_round is not None:
+                if (
+                        _looks_like_verification_command(command)
+                        and _is_related_to_latest_mutation(command, state)
+                ):
+                    state.last_verification_round = round_id
+            elif _looks_like_verification_command(command):
+                state.last_verification_round = round_id
 
         intervention = None
         if self.enabled:
@@ -401,29 +514,46 @@ class OSMonitor:
         }
 
     def _detect_step_level_issues(
-        self,
-        state: TrajectoryState,
-        step: StepRecord,
+            self,
+            state: TrajectoryState,
+            step: StepRecord,
     ) -> List[str]:
         reason_codes: List[str] = []
+
         previous_step = state.recent_steps[-2] if len(state.recent_steps) >= 2 else None
 
+        similar_repeat_found = False
+        for record in state.recent_steps[-4:-1]:
+            if (
+                    record.normalized_command == step.normalized_command
+                    and output_similarity(step.output, record.output) >= self.loop_similarity_threshold
+            ):
+                similar_repeat_found = True
+                break
+
         if (
-            previous_step
-            and step.normalized_command == previous_step.normalized_command
-            and output_similarity(step.output, previous_step.output) >= self.loop_similarity_threshold
+                previous_step
+                and step.normalized_command == previous_step.normalized_command
+                and output_similarity(step.output, previous_step.output) >= self.loop_similarity_threshold
         ):
+            reason_codes.append("loop")
+            state.remember_blocked_command(step.command)
+        elif similar_repeat_found:
             reason_codes.append("loop")
             state.remember_blocked_command(step.command)
 
         if (
-            step.command_type in {"inspection", "mixed", "unknown"}
-            and not step.informative
-            and _command_complexity(step.command) >= 2
+                step.command_type in {"inspection", "mixed", "unknown"}
+                and not step.informative
+                and _command_complexity(step.command) >= 2
         ):
             reason_codes.append("complex_empty")
 
-        if len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
+        recent_window = state.recent_steps[-4:]
+        suspicious_count = sum(1 for record in recent_window if record.suspicious)
+        if len(recent_window) >= 3 and suspicious_count >= 3:
+            reason_codes.append("stall")
+        elif len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
             reason_codes.append("stall")
 
         return self._dedupe(reason_codes)
