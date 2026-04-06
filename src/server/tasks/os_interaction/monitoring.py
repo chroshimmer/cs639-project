@@ -306,78 +306,308 @@ class MonitorIntervention:
 
 
 class OSReplanner:
+    def _infer_phase(self, state: TrajectoryState) -> str:
+        if not state.recent_steps:
+            return "diagnose"
+
+        latest = state.recent_steps[-1]
+
+        if state.evaluation_type == "match":
+            if latest.error_tags:
+                return "diagnose"
+            if not state.has_productive_observation():
+                return "diagnose"
+            return "answer"
+
+        if state.last_mutation_round is not None and not state.has_verification_after_mutation():
+            return "verify"
+
+        if latest.error_tags:
+            return "diagnose"
+
+        if not state.has_productive_observation():
+            return "diagnose"
+
+        return "mutate"
+
+    def _target_hints(self, state: TrajectoryState) -> List[str]:
+        hints: List[str] = []
+
+        latest_mutation = _get_latest_mutation_step(state)
+        if latest_mutation:
+            hints.extend(_extract_paths(latest_mutation.command, latest_mutation.output))
+
+        if not hints:
+            hints.extend(_extract_paths(state.goal))
+
+        if not hints and state.known_paths:
+            hints.extend(state.known_paths[-4:])
+
+        goal_keywords = list(_command_keywords(state.goal))
+        for kw in goal_keywords[:4]:
+            if kw not in hints:
+                hints.append(kw)
+
+        deduped: List[str] = []
+        for item in hints:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped[:5]
+
+    def _completed_evidence(self, state: TrajectoryState) -> List[str]:
+        evidence: List[str] = []
+
+        for step in state.recent_steps[-4:]:
+            if step.informative:
+                prefix = "error seen" if step.error_tags else "observed"
+                evidence.append(f"{prefix}: {step.output_excerpt}")
+
+        if state.last_mutation_round is not None:
+            evidence.append(f"state-changing step already happened at round {state.last_mutation_round}")
+
+        if state.has_verification_after_mutation():
+            evidence.append("latest state change has been verified")
+
+        deduped: List[str] = []
+        for item in evidence:
+            if item not in deduped:
+                deduped.append(item)
+        return deduped[:4]
+
+    def _remaining_subgoals(self, state: TrajectoryState, phase: str) -> List[str]:
+        goals: List[str] = []
+
+        if state.evaluation_type == "match":
+            if not state.has_productive_observation():
+                goals.append("collect one direct shell observation that contains the answer")
+            goals.append("extract the exact answer string/number from evidence")
+            goals.append("use answer_action only after the answer is directly grounded")
+            return goals[:3]
+
+        if not state.has_productive_observation():
+            goals.append("diagnose the current state of the target")
+
+        if state.last_mutation_round is None:
+            goals.append("apply exactly one state-changing command that moves toward the goal")
+
+        if state.last_mutation_round is not None and not state.has_verification_after_mutation():
+            goals.append("verify the final state on the same target after the mutation")
+
+        goals.append("finish only after the verification output matches the task goal")
+
+        phase_hint = {
+            "diagnose": "next step should reduce uncertainty, not guess",
+            "mutate": "next step should change only one thing, then verify",
+            "verify": "next step should directly confirm the changed target",
+            "answer": "next step should produce the exact grounded answer",
+        }
+        goals.append(phase_hint.get(phase, "next step should be simple and targeted"))
+        return goals[:4]
+
+    def _pick_failure_type(self, reason_codes: List[str], latest_step: Optional[StepRecord]) -> str:
+        latest_tags = set(latest_step.error_tags if latest_step else [])
+
+        if "missing_verification" in reason_codes:
+            return "missing_verification"
+        if "loop" in reason_codes or "stall" in reason_codes:
+            return "ineffective_search"
+        if "missing_file" in latest_tags:
+            return "wrong_target"
+        if "permission" in latest_tags:
+            return "permission_barrier"
+        if "bad_command" in latest_tags or "parse_error" in latest_tags:
+            return "bad_command"
+        if "service_state" in latest_tags:
+            return "state_mismatch"
+        if "no_grounding_for_answer" in reason_codes:
+            return "ungrounded_answer"
+        if "latest_step_empty" in reason_codes or "complex_empty" in reason_codes:
+            return "weak_signal"
+        return "generic_replan"
+
+    def _typed_recovery_actions(self, failure_type: str, state: TrajectoryState) -> List[str]:
+        target_hints = self._target_hints(state)
+        target_text = ", ".join(target_hints[:3]) if target_hints else "the intended target"
+
+        templates = {
+            "ineffective_search": [
+                "Stop broad exploration and do not repeat a blocked command.",
+                f"Pick one target and narrow the search around {target_text}.",
+                "Run exactly one short diagnostic command before any further mutation.",
+            ],
+            "wrong_target": [
+                "Your current target may be wrong.",
+                f"Re-identify the target first using a direct check around {target_text}.",
+                "Do not mutate anything until the target identity is confirmed.",
+            ],
+            "permission_barrier": [
+                "The last step failed because of permissions or write constraints.",
+                "Diagnose who owns the target and what the current mode/state is.",
+                "Choose one corrective command, then verify immediately.",
+            ],
+            "bad_command": [
+                "The previous command form is likely invalid for this environment.",
+                "Switch to a simpler standard shell command.",
+                "Prefer one direct check or one direct corrective action, not a chained command.",
+            ],
+            "state_mismatch": [
+                "The environment state does not match your assumption.",
+                "Refresh the current state with one direct status check.",
+                "Only then choose whether to mutate or verify.",
+            ],
+            "missing_verification": [
+                "A state change likely happened, but it has not been verified yet.",
+                f"Run one direct verification command on {target_text}.",
+                "Do not finish until the verification output matches the goal.",
+            ],
+            "ungrounded_answer": [
+                "The answer is not yet grounded in a direct shell observation.",
+                "Collect one exact observation that contains the final answer.",
+                "Then answer with the exact value only.",
+            ],
+            "weak_signal": [
+                "The latest evidence is weak or empty.",
+                "Use a simpler command that gives direct evidence on the target.",
+                "Avoid complex pipelines until the state is clear.",
+            ],
+            "generic_replan": [
+                "Re-state the remaining subgoal before the next tool call.",
+                "Choose exactly one next action type: diagnose, mutate, or verify.",
+                "Prefer a simple command with direct evidence.",
+            ],
+        }
+        return templates.get(failure_type, templates["generic_replan"])
+
     def build_memory_card(self, state: TrajectoryState) -> Optional[str]:
         if not state.recent_steps:
             return None
 
-        lines = ["[STATE MEMORY]", f"Goal: {state.goal}"]
+        phase = self._infer_phase(state)
+        targets = self._target_hints(state)
+        completed = self._completed_evidence(state)
+        remaining = self._remaining_subgoals(state, phase)
+
+        lines = [
+            "[WORKING PLAN]",
+            f"Goal: {state.goal}",
+            f"Current phase: {phase}",
+        ]
+
         if state.evaluation_type == "match":
-            lines.append("Need: return an exact answer after collecting direct evidence.")
+            lines.append("Task type: exact-answer task. You must ground the answer in shell evidence.")
         else:
-            lines.append("Need: change the OS state if required, then verify it before finishing.")
+            lines.append("Task type: state-change task. Change state only if needed, then verify before finish.")
+
+        if targets:
+            lines.append(f"Target hints: {', '.join(targets)}")
+
+        lines.append("Completed evidence:")
+        for item in completed[:4]:
+            lines.append(f"- {item}")
+
+        lines.append("Remaining subgoals:")
+        for item in remaining[:4]:
+            lines.append(f"- {item}")
 
         lines.append("Recent commands:")
         for idx, step in enumerate(state.recent_steps[-3:], start=1):
             lines.append(f"{idx}. {step.normalized_command[:140]}")
 
-        lines.append("Key observations:")
+        lines.append("Recent observations:")
         for idx, step in enumerate(state.recent_steps[-3:], start=1):
-            observation = step.output_excerpt
+            obs = step.output_excerpt
             if step.error_tags:
-                observation = f"{observation} [tags: {', '.join(step.error_tags)}]"
-            lines.append(f"{idx}. {observation}")
+                obs = f"{obs} [tags: {', '.join(step.error_tags)}]"
+            lines.append(f"{idx}. {obs}")
 
-        if state.known_paths:
-            lines.append(f"Known paths: {', '.join(state.known_paths[-4:])}")
         if state.blocked_commands:
-            lines.append("Do not repeat:")
+            lines.append("Blocked patterns:")
             for command in state.blocked_commands[-2:]:
                 lines.append(f"- {command[:140]}")
+
         if state.last_mutation_round is not None:
             verified = "yes" if state.has_verification_after_mutation() else "no"
-            lines.append(f"Verified after latest state change: {verified}")
+            lines.append(f"Verified after latest mutation: {verified}")
+
+        lines.append("Next-step policy:")
+        if phase == "diagnose":
+            lines.append("- Execute exactly one diagnostic command next.")
+            lines.append("- Prefer ls/stat/find/ps/systemctl status over broad search or repeated mutation.")
+        elif phase == "mutate":
+            lines.append("- Execute exactly one corrective mutation next.")
+            lines.append("- After mutation, the following step should be verification.")
+        elif phase == "verify":
+            lines.append("- Execute exactly one direct verification command on the changed target.")
+            lines.append("- Do not finish before the verification output matches the goal.")
+        else:
+            lines.append("- Answer only with the exact grounded result.")
+            lines.append("- Do not finish without direct evidence in the recent shell output.")
 
         return "\n".join(lines)
 
     def build_recovery_prompt(
-        self,
-        state: TrajectoryState,
-        reason_codes: List[str],
-        latest_step: StepRecord,
+            self,
+            state: TrajectoryState,
+            reason_codes: List[str],
+            latest_step: StepRecord,
     ) -> str:
-        reasons = [f"- {_REASON_TEXT[code]}" for code in reason_codes if code in _REASON_TEXT]
-        if not reasons:
-            reasons = ["- recent evidence is weak, so you should re-check your plan"]
+        failure_type = self._pick_failure_type(reason_codes, latest_step)
+        typed_actions = self._typed_recovery_actions(failure_type, state)
+        remaining = self._remaining_subgoals(state, self._infer_phase(state))
+
+        reason_lines = [f"- {_REASON_TEXT[code]}" for code in reason_codes if code in _REASON_TEXT]
+        if not reason_lines:
+            reason_lines = ["- recent evidence is weak, so you should re-check your plan"]
 
         lines = [
-            "[Monitor] Potential long-horizon stall detected.",
+            "[Monitor] Recovery required.",
+            f"Detected failure type: {failure_type}",
             "Why this was flagged:",
-            *reasons[:3],
+            *reason_lines[:3],
             f"Latest observation: {latest_step.output_excerpt}",
-            "Replan before the next tool call.",
-            "1. Do not repeat a blocked command unless new evidence appears.",
-            "2. Pick one next action type: diagnose the state, change the state, or verify the state.",
-            "3. Prefer a simpler command that gives direct evidence.",
+            "Do this before the next tool call:",
         ]
+        for item in typed_actions[:3]:
+            lines.append(f"- {item}")
+
+        lines.append("Remaining subgoals right now:")
+        for item in remaining[:3]:
+            lines.append(f"- {item}")
+
+        lines.append(
+            "Constraint: the next tool call should perform exactly one action type: diagnose, mutate, verify, or answer.")
         return "\n".join(lines)
 
     def build_commit_block_prompt(
-        self,
-        state: TrajectoryState,
-        action_name: str,
-        reason_codes: List[str],
+            self,
+            state: TrajectoryState,
+            action_name: str,
+            reason_codes: List[str],
     ) -> str:
         action_label = "finish" if action_name == "finish_action" else "answer"
-        reasons = [f"- {_REASON_TEXT[code]}" for code in reason_codes if code in _REASON_TEXT]
+        latest_step = state.recent_steps[-1] if state.recent_steps else None
+        failure_type = self._pick_failure_type(reason_codes, latest_step)
+        typed_actions = self._typed_recovery_actions(failure_type, state)
+        remaining = self._remaining_subgoals(state, self._infer_phase(state))
+
+        reason_lines = [f"- {_REASON_TEXT[code]}" for code in reason_codes if code in _REASON_TEXT]
+
         lines = [
             f"[Monitor] Proposed {action_label} was blocked.",
+            f"Detected failure type: {failure_type}",
             "Why this was flagged:",
-            *reasons[:3],
+            *reason_lines[:3],
             "Before the next completion attempt:",
-            "1. Gather one more direct observation or verification step.",
-            "2. If the last step failed, diagnose or correct that failure first.",
-            "3. Only answer/finish after the evidence matches the task goal.",
         ]
+        for item in typed_actions[:2]:
+            lines.append(f"- {item}")
+
+        lines.append("Still missing:")
+        for item in remaining[:3]:
+            lines.append(f"- {item}")
+
+        lines.append(
+            f"Do not call {action_label} again until one missing subgoal is resolved by direct shell evidence.")
         return "\n".join(lines)
 
 
