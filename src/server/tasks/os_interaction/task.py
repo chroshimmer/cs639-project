@@ -23,6 +23,7 @@ from openai.types.chat import (ChatCompletionSystemMessageParam,
                                ChatCompletionUserMessageParam)
 
 from .environment import OSEnvironmentDelegation
+from .monitoring import OSMonitor, TrajectoryState
 
 if TYPE_CHECKING:
     from agentrl.worker.environment import EnvironmentController
@@ -79,7 +80,7 @@ class Container:
         # ... ']' and any digits, a semicolon, any characters except BEL (0x07), and ending with BEL
         output = re.sub(b'\x1b][0-9]*;[^\x07]*\x07', b'', output)
         # ... '[?2004' and either 'h' or 'l'
-        output = re.sub(b'\x1b\[\?2004[hl]', b'', output)
+        output = re.sub(b'\x1b\\[\\?2004[hl]', b'', output)
 
         # Remove BEL characters (0x07)
         output = re.sub(b'\x07', b'', output)
@@ -150,6 +151,7 @@ class OSInteraction(Task):
                  docker_config,
                  round_limit=8,
                  tools=None,
+                 monitor_config: Optional[dict] = None,
                  env_driver: str = 'docker',
                  env_options: Optional[dict] = None,
                  **kwargs):
@@ -158,6 +160,7 @@ class OSInteraction(Task):
         self.data_config = data_config
         self.docker_config = docker_config
         self.tools = tools
+        self.monitor = OSMonitor(monitor_config)
         self.full_async = True
         self.problem_configs: Dict[str, Dict[str, Any]] = {}  # {index: CONFIG}
 
@@ -409,6 +412,10 @@ class OSInteraction(Task):
 
         # 注入初始消息
         self._inject_initial_messages(session, config.description)
+        state = self.monitor.create_state(
+            goal=config.description,
+            evaluation_type=config.get_evaluation_type(),
+        )
 
         # 初始化状态变量
         finish = False
@@ -419,10 +426,11 @@ class OSInteraction(Task):
         for round_num in range(self.round_limit):
             logging.info(f"Starting round {round_num + 1}/{self.round_limit}")
             round_reward = 0
+            self._inject_state_memory(session, state, round_num)
 
             # 处理Agent行动
             action_result = await self._handle_agent_action(
-                session, container, round_num, finish, round_reward, function_name, call_id
+                session, container, round_num, finish, round_reward, function_name, call_id, state
             )
 
             # 更新状态
@@ -432,7 +440,7 @@ class OSInteraction(Task):
 
             # 检查是否有错误或需要提前结束
             if action_result.get("early_return"):
-                return action_result.get("result")
+                return self._attach_monitor_summary(action_result.get("result"), state)
 
             # 如果得到答案，跳出循环
             if "answer" in action_result:
@@ -446,9 +454,12 @@ class OSInteraction(Task):
             final_rewardhistory = RewardHistoryItem(reward=0, score=0)
             session.inject(final_rewardhistory)
 
-            return TaskSampleExecutionResult(
-                status=SampleStatus.TASK_LIMIT_REACHED,
-                result={"result": False, "reason": "round limit"},
+            return self._attach_monitor_summary(
+                TaskSampleExecutionResult(
+                    status=SampleStatus.TASK_LIMIT_REACHED,
+                    result={"result": False, "reason": "round limit"},
+                ),
+                state,
             )
 
         # 评估答案
@@ -456,7 +467,7 @@ class OSInteraction(Task):
 
         # 如果发生评估错误
         if evaluation_result.get("error"):
-            return evaluation_result.get("result")
+            return self._attach_monitor_summary(evaluation_result.get("result"), state)
 
         # 设置最终奖励
         jd = evaluation_result.get("success", False)
@@ -469,8 +480,12 @@ class OSInteraction(Task):
         final_rewardhistory = RewardHistoryItem(reward=final_reward, score=os_score)
         session.inject(final_rewardhistory)
 
-        return TaskSampleExecutionResult(
-            status=SampleStatus.COMPLETED, result={"result": jd}
+        return self._attach_monitor_summary(
+            TaskSampleExecutionResult(
+                status=SampleStatus.COMPLETED,
+                result={"result": jd},
+            ),
+            state,
         )
 
     async def _setup_execution_environment(
@@ -532,9 +547,55 @@ Always use a tool provided instead of simply responding with content."""
             content=f'Now, I will start a new problem in a new OS. My problem is:\n\n{description}'
         ))
 
+    def _inject_state_memory(
+            self, session: Session, state: TrajectoryState, round_num: int
+    ) -> None:
+        if round_num == 0:
+            return
+        memory_card = self.monitor.build_memory_card(state)
+        if memory_card:
+            session.inject(ChatCompletionUserMessageParam(
+                role='user',
+                content=memory_card,
+            ))
+
+    @staticmethod
+    def _apply_monitor_intervention(
+            session: Session, intervention, tool_call_id: Optional[str] = None
+    ) -> None:
+        if intervention.tool_message and tool_call_id:
+            session.inject(ChatCompletionToolMessageParam(
+                role='tool',
+                content=intervention.tool_message,
+                tool_call_id=tool_call_id,
+            ))
+        if intervention.user_message:
+            session.inject(ChatCompletionUserMessageParam(
+                role='user',
+                content=intervention.user_message,
+            ))
+
+    def _attach_monitor_summary(
+            self,
+            task_result: TaskSampleExecutionResult,
+            state: TrajectoryState,
+    ) -> TaskSampleExecutionResult:
+        if task_result is None:
+            return task_result
+        if not self.monitor.enabled:
+            return task_result
+
+        result_payload = task_result.result or {}
+        if not isinstance(result_payload, dict):
+            result_payload = {"result": result_payload}
+        result_payload["monitor_summary"] = self.monitor.build_summary(state)
+        task_result.result = result_payload
+        return task_result
+
     async def _handle_agent_action(
             self, session: Session, container: Container, round_num: int,
-            finish: bool, round_reward: float, function_name: Optional[str], call_id: Optional[str]
+            finish: bool, round_reward: float, function_name: Optional[str], call_id: Optional[str],
+            state: TrajectoryState,
     ) -> dict:
         # 获取Agent行动
         response = await session.action()
@@ -628,11 +689,26 @@ Always use a tool provided instead of simply responding with content."""
         # 提交答案
         if action == "commit":
             logging.info("Received commit action with answer")
-            result["answer"] = content
-            result["finish"] = True
+            commit_guard = self.monitor.check_commit(state, function_name, content)
+            if commit_guard:
+                logging.info(f"Monitor blocked commit: {commit_guard.summary}")
+                self._apply_monitor_intervention(session, commit_guard, call_id)
+            else:
+                result["answer"] = content
+                result["finish"] = True
         # 执行bash命令
         elif action == "bash":
-            await self._execute_bash_command(session, container, content, call_id)
+            bash_info = await self._execute_bash_command(session, container, content, call_id)
+            _, intervention = self.monitor.record_bash(
+                state,
+                round_num,
+                content,
+                bash_info["output_text"],
+                output_was_truncated=bash_info["output_was_truncated"],
+            )
+            if intervention:
+                logging.info(f"Monitor injected replanning prompt: {intervention.summary}")
+                self._apply_monitor_intervention(session, intervention)
 
         # 注入回合奖励
         round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
@@ -642,7 +718,7 @@ Always use a tool provided instead of simply responding with content."""
 
     async def _execute_bash_command(
             self, session: Session, container: Container, command: str, id: str
-    ) -> None:
+    ) -> Dict[str, Any]:
         """执行bash命令并处理结果"""
         logging.info("Executing bash command")
 
@@ -657,8 +733,10 @@ Always use a tool provided instead of simply responding with content."""
             result_text = "OS Environment output cannot be decoded as UTF-8"
 
         # 截断过长输出
+        output_was_truncated = False
         if len(result_text) > 800:
             logging.debug("Output truncated due to length")
+            output_was_truncated = True
             result_text = result_text[:780] + "\n[truncated because the output is too long]"
 
         # 注入结果
@@ -667,6 +745,10 @@ Always use a tool provided instead of simply responding with content."""
             content=f'The output of the OS:\n\n{result_text}' if result_text else "The output of the OS is empty.",
             tool_call_id=id
         ))
+        return {
+            "output_text": result_text,
+            "output_was_truncated": output_was_truncated,
+        }
 
     async def _evaluate_answer(
             self, answer, config: JudgeConfig, container: Container, session: Session

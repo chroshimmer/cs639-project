@@ -29,6 +29,12 @@ Some edits were made to make AgentBench FC (OS) runnable on CSL machines:
   - `extra/docker-compose.os-only.yml`  
   (Goal: start only what we need for OS tasks: controller + redis + `os_interaction-std` worker.)
 
+- **Added a lightweight monitor + replanner path for OS tasks**
+  - `src/server/tasks/os_interaction/monitoring.py`
+  - `src/server/tasks/os_interaction/task.py`
+  - `configs/tasks/os.yaml`  
+  (Goal: keep the original `os-std` baseline intact, while adding `os-std-monitor-replan` with state memory, loop/stall detection, commit gating, and recovery prompts.)
+
 These edits are intended for CSL machines; on other systems you may not need them.
 
 ---
@@ -79,6 +85,13 @@ curl -s -H 'Content-Type: application/json' \
   http://localhost:5020/api/start_sample | head -c 300; echo
 ```
 
+Optional sanity check for the monitored variant:
+```bash
+curl -s -H 'Content-Type: application/json' \
+  -d '{"name":"os-std-monitor-replan","index":0,"custom_task":null}' \
+  http://localhost:5020/api/start_sample | head -c 300; echo
+```
+
 ### Step 5 — Run evaluation
 
 Set API key (AgentRL evaluator uses this variable reliably):
@@ -100,6 +113,19 @@ agentrl-eval \
   os-std
 ```
 
+Monitor + replanner variant:
+```bash
+agentrl-eval \
+  --no-interactive \
+  -c http://localhost:5020/api \
+  -u https://api.openai.com/v1 \
+  -m gpt-5.1 \
+  --concurrency 4 \
+  -n 1 \
+  -o results \
+  os-std-monitor-replan
+```
+
 Full run (144 indices):
 ```bash
 agentrl-eval \
@@ -118,6 +144,8 @@ Outputs go to:
   - `run.log`
   - `results.jsonl`
   - per-index traces (e.g., `*/trace.json`)
+
+The `os-std-monitor-replan` traces additionally contain injected `[STATE MEMORY]` and `[Monitor]` messages, which makes later trajectory analysis easier.
 
 ---
 

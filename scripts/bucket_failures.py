@@ -60,7 +60,11 @@ def compress_trace(trace_data: list) -> str:
             role = turn.get("type", "unknown")
             
         if role in ["system", "user"]:
-            condensed.append(f"[{role.upper()}]: {turn.get('content', '')}")
+            content = turn.get("content", "")
+            label = "MONITOR" if isinstance(content, str) and content.startswith("[Monitor]") else role.upper()
+            if isinstance(content, str) and content.startswith("[STATE MEMORY]"):
+                label = "STATE_MEMORY"
+            condensed.append(f"[{label}]: {content}")
             
         elif role == "function_call":
             name = turn.get("name", "unknown_tool")
@@ -69,7 +73,8 @@ def compress_trace(trace_data: list) -> str:
             
         elif role == "tool":
             content = turn.get("content", "").strip()
-            condensed.append(f"[OS_FEEDBACK]: {content}")
+            label = "MONITOR" if content.startswith("[Monitor]") else "OS_FEEDBACK"
+            condensed.append(f"[{label}]: {content}")
             
     return "\n".join(condensed)
 
