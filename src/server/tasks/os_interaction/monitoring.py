@@ -243,6 +243,30 @@ def _is_related_to_latest_mutation(command: str, state: "TrajectoryState") -> bo
     return bool(current_keywords and mutation_keywords and current_keywords.intersection(mutation_keywords))
 
 
+def _looks_like_setup_or_bootstrap(command: str) -> bool:
+    cmd = normalize_command(command).lower()
+    hints = (
+        "mkdir",
+        "touch",
+        "cat >",
+        "cat >>",
+        "<<",
+        "python - <<",
+        "python3 - <<",
+        "chmod",
+        "chown",
+        "cp ",
+        "mv ",
+        "tar ",
+        "unzip ",
+        "setup",
+        "init",
+        "bootstrap",
+        "mktemp",
+    )
+    return any(hint in cmd for hint in hints)
+
+
 @dataclass
 class StepRecord:
     round_id: int
@@ -306,13 +330,77 @@ class MonitorIntervention:
 
 
 class OSReplanner:
+    def _infer_task_mode_from_goal(self, goal: str) -> str:
+        goal_l = (goal or "").lower()
+
+        answer_patterns = (
+            "how many",
+            "what is",
+            "calculate",
+            "determine",
+            "count",
+            "single integer",
+            "return an integer",
+            "answer as an integer",
+            "yes or no",
+            "total number",
+            "number of lines",
+            "number of files",
+            "number of directories",
+            "total occurrences",
+            "sum of",
+            "print the result",
+            "respond with",
+            "which file",
+            "which directory",
+        )
+        state_patterns = (
+            "create ",
+            "set ",
+            "change ",
+            "modify ",
+            "rename ",
+            "delete ",
+            "remove ",
+            "install ",
+            "uninstall ",
+            "start ",
+            "stop ",
+            "restart ",
+            "permission",
+            "read-only",
+            "readable",
+            "writable",
+            "move ",
+            "copy ",
+            "append ",
+            "write ",
+            "replace ",
+            "kill ",
+            "make ",
+        )
+
+        answer_hit = any(pattern in goal_l for pattern in answer_patterns)
+        state_hit = any(pattern in goal_l for pattern in state_patterns)
+
+        if answer_hit and not state_hit:
+            return "answer"
+        if state_hit and not answer_hit:
+            return "state"
+        if answer_hit:
+            return "answer"
+        if "integer" in goal_l or "answer" in goal_l or "count" in goal_l:
+            return "answer"
+        return "state"
+
     def _infer_phase(self, state: TrajectoryState) -> str:
         if not state.recent_steps:
             return "diagnose"
 
+        task_mode = self._infer_task_mode_from_goal(state.goal)
         latest = state.recent_steps[-1]
 
-        if state.evaluation_type == "match":
+        if task_mode == "answer":
             if latest.error_tags:
                 return "diagnose"
             if not state.has_productive_observation():
@@ -376,13 +464,15 @@ class OSReplanner:
 
     def _remaining_subgoals(self, state: TrajectoryState, phase: str) -> List[str]:
         goals: List[str] = []
+        task_mode = self._infer_task_mode_from_goal(state.goal)
 
-        if state.evaluation_type == "match":
+        if task_mode == "answer":
             if not state.has_productive_observation():
                 goals.append("collect one direct shell observation that contains the answer")
             goals.append("extract the exact answer string/number from evidence")
+            goals.append("do not change the environment just to make the answer easier")
             goals.append("use answer_action only after the answer is directly grounded")
-            return goals[:3]
+            return goals[:4]
 
         if not state.has_productive_observation():
             goals.append("diagnose the current state of the target")
@@ -404,8 +494,14 @@ class OSReplanner:
         goals.append(phase_hint.get(phase, "next step should be simple and targeted"))
         return goals[:4]
 
-    def _pick_failure_type(self, reason_codes: List[str], latest_step: Optional[StepRecord]) -> str:
+    def _pick_failure_type(
+        self,
+        reason_codes: List[str],
+        latest_step: Optional[StepRecord],
+        state: Optional[TrajectoryState] = None,
+    ) -> str:
         latest_tags = set(latest_step.error_tags if latest_step else [])
+        task_mode = self._infer_task_mode_from_goal(state.goal) if state else "state"
 
         if "missing_verification" in reason_codes:
             return "missing_verification"
@@ -423,13 +519,44 @@ class OSReplanner:
             return "ungrounded_answer"
         if "latest_step_empty" in reason_codes or "complex_empty" in reason_codes:
             return "weak_signal"
+        if task_mode == "answer":
+            return "ungrounded_answer"
         return "generic_replan"
 
     def _typed_recovery_actions(self, failure_type: str, state: TrajectoryState) -> List[str]:
         target_hints = self._target_hints(state)
         target_text = ", ".join(target_hints[:3]) if target_hints else "the intended target"
+        task_mode = self._infer_task_mode_from_goal(state.goal)
 
-        templates = {
+        answer_templates = {
+            "ineffective_search": [
+                "Stop broad exploration and do not repeat a blocked command.",
+                f"Run one short diagnostic command that directly answers the question about {target_text}.",
+                "Do not mutate the environment for a query-style task.",
+            ],
+            "wrong_target": [
+                "Your current target may be wrong.",
+                f"Re-identify the target first using a direct read-only check around {target_text}.",
+                "Do not mutate anything until the target identity is confirmed.",
+            ],
+            "ungrounded_answer": [
+                "The answer is not yet grounded in a direct shell observation.",
+                "Collect one exact observation that contains the final answer.",
+                "Then answer with the exact value only.",
+            ],
+            "weak_signal": [
+                "The latest evidence is weak or empty.",
+                "Use a simpler read-only command that gives direct evidence on the target.",
+                "Do not change the environment just to make the answer easier.",
+            ],
+            "generic_replan": [
+                "Re-state the question in one sentence before the next tool call.",
+                "Choose one short read-only command that directly narrows the answer.",
+                "Answer only after the result is grounded in shell output.",
+            ],
+        }
+
+        state_templates = {
             "ineffective_search": [
                 "Stop broad exploration and do not repeat a blocked command.",
                 f"Pick one target and narrow the search around {target_text}.",
@@ -476,6 +603,8 @@ class OSReplanner:
                 "Prefer a simple command with direct evidence.",
             ],
         }
+
+        templates = answer_templates if task_mode == "answer" else state_templates
         return templates.get(failure_type, templates["generic_replan"])
 
     def build_memory_card(self, state: TrajectoryState) -> Optional[str]:
@@ -483,6 +612,7 @@ class OSReplanner:
             return None
 
         phase = self._infer_phase(state)
+        task_mode = self._infer_task_mode_from_goal(state.goal)
         targets = self._target_hints(state)
         completed = self._completed_evidence(state)
         remaining = self._remaining_subgoals(state, phase)
@@ -493,8 +623,8 @@ class OSReplanner:
             f"Current phase: {phase}",
         ]
 
-        if state.evaluation_type == "match":
-            lines.append("Task type: exact-answer task. You must ground the answer in shell evidence.")
+        if task_mode == "answer":
+            lines.append("Task type: answer/query task. Ground the answer in shell evidence and avoid changing the environment.")
         else:
             lines.append("Task type: state-change task. Change state only if needed, then verify before finish.")
 
@@ -530,7 +660,14 @@ class OSReplanner:
             lines.append(f"Verified after latest mutation: {verified}")
 
         lines.append("Next-step policy:")
-        if phase == "diagnose":
+        if task_mode == "answer":
+            if phase == "diagnose":
+                lines.append("- Execute exactly one short read-only diagnostic command next.")
+                lines.append("- Prefer ls/stat/find/wc/grep/cat over any state-changing command.")
+            else:
+                lines.append("- Answer only with the exact grounded result.")
+                lines.append("- Do not change the environment just to make the answer easier.")
+        elif phase == "diagnose":
             lines.append("- Execute exactly one diagnostic command next.")
             lines.append("- Prefer ls/stat/find/ps/systemctl status over broad search or repeated mutation.")
         elif phase == "mutate":
@@ -546,14 +683,15 @@ class OSReplanner:
         return "\n".join(lines)
 
     def build_recovery_prompt(
-            self,
-            state: TrajectoryState,
-            reason_codes: List[str],
-            latest_step: StepRecord,
+        self,
+        state: TrajectoryState,
+        reason_codes: List[str],
+        latest_step: StepRecord,
     ) -> str:
-        failure_type = self._pick_failure_type(reason_codes, latest_step)
+        failure_type = self._pick_failure_type(reason_codes, latest_step, state)
         typed_actions = self._typed_recovery_actions(failure_type, state)
         remaining = self._remaining_subgoals(state, self._infer_phase(state))
+        task_mode = self._infer_task_mode_from_goal(state.goal)
 
         reason_lines = [f"- {_REASON_TEXT[code]}" for code in reason_codes if code in _REASON_TEXT]
         if not reason_lines:
@@ -574,19 +712,21 @@ class OSReplanner:
         for item in remaining[:3]:
             lines.append(f"- {item}")
 
-        lines.append(
-            "Constraint: the next tool call should perform exactly one action type: diagnose, mutate, verify, or answer.")
+        if task_mode == "answer":
+            lines.append("Constraint: the next tool call should be read-only unless the task explicitly asks for a state change.")
+        else:
+            lines.append("Constraint: the next tool call should perform exactly one action type: diagnose, mutate, verify, or answer.")
         return "\n".join(lines)
 
     def build_commit_block_prompt(
-            self,
-            state: TrajectoryState,
-            action_name: str,
-            reason_codes: List[str],
+        self,
+        state: TrajectoryState,
+        action_name: str,
+        reason_codes: List[str],
     ) -> str:
         action_label = "finish" if action_name == "finish_action" else "answer"
         latest_step = state.recent_steps[-1] if state.recent_steps else None
-        failure_type = self._pick_failure_type(reason_codes, latest_step)
+        failure_type = self._pick_failure_type(reason_codes, latest_step, state)
         typed_actions = self._typed_recovery_actions(failure_type, state)
         remaining = self._remaining_subgoals(state, self._infer_phase(state))
 
@@ -606,8 +746,7 @@ class OSReplanner:
         for item in remaining[:3]:
             lines.append(f"- {item}")
 
-        lines.append(
-            f"Do not call {action_label} again until one missing subgoal is resolved by direct shell evidence.")
+        lines.append(f"Do not call {action_label} again until one missing subgoal is resolved by direct shell evidence.")
         return "\n".join(lines)
 
 
@@ -641,7 +780,12 @@ class OSMonitor:
         command_type = _classify_command(command)
         error_tags = extract_error_tags(output)
         informative = bool((output or "").strip())
-        suspicious = bool(error_tags) or (command_type != "mutation" and not informative)
+        suppress_empty_signal = (
+            not informative
+            and not error_tags
+            and (command_type in {"mutation", "mixed"} or _looks_like_setup_or_bootstrap(command))
+        )
+        suspicious = bool(error_tags) or (command_type not in {"mutation", "mixed"} and not informative and not suppress_empty_signal)
 
         step = StepRecord(
             round_id=round_id,
@@ -665,8 +809,8 @@ class OSMonitor:
         elif command_type in {"inspection", "unknown"} and informative:
             if state.last_mutation_round is not None:
                 if (
-                        _looks_like_verification_command(command)
-                        and _is_related_to_latest_mutation(command, state)
+                    _looks_like_verification_command(command)
+                    and _is_related_to_latest_mutation(command, state)
                 ):
                     state.last_verification_round = round_id
             elif _looks_like_verification_command(command):
@@ -690,8 +834,9 @@ class OSMonitor:
             return None
 
         reason_codes: List[str] = []
+        task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
 
-        if action_name == "finish_action" and state.evaluation_type == "match":
+        if action_name == "finish_action" and task_mode == "answer":
             reason_codes.append("finish_on_match")
 
         if not state.recent_steps:
@@ -700,10 +845,14 @@ class OSMonitor:
             latest_step = state.recent_steps[-1]
             if latest_step.error_tags:
                 reason_codes.append("latest_step_failed")
-            if latest_step.command_type != "mutation" and not latest_step.informative:
+            if (
+                latest_step.command_type not in {"mutation", "mixed"}
+                and not latest_step.informative
+                and not _looks_like_setup_or_bootstrap(latest_step.command)
+            ):
                 reason_codes.append("latest_step_empty")
 
-        if action_name == "finish_action" and state.evaluation_type == "check":
+        if action_name == "finish_action" and task_mode == "state":
             if state.last_mutation_round is None:
                 reason_codes.append("finish_without_state_change")
             elif not state.has_verification_after_mutation():
@@ -744,27 +893,28 @@ class OSMonitor:
         }
 
     def _detect_step_level_issues(
-            self,
-            state: TrajectoryState,
-            step: StepRecord,
+        self,
+        state: TrajectoryState,
+        step: StepRecord,
     ) -> List[str]:
         reason_codes: List[str] = []
+        task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
 
         previous_step = state.recent_steps[-2] if len(state.recent_steps) >= 2 else None
 
         similar_repeat_found = False
         for record in state.recent_steps[-4:-1]:
             if (
-                    record.normalized_command == step.normalized_command
-                    and output_similarity(step.output, record.output) >= self.loop_similarity_threshold
+                record.normalized_command == step.normalized_command
+                and output_similarity(step.output, record.output) >= self.loop_similarity_threshold
             ):
                 similar_repeat_found = True
                 break
 
         if (
-                previous_step
-                and step.normalized_command == previous_step.normalized_command
-                and output_similarity(step.output, previous_step.output) >= self.loop_similarity_threshold
+            previous_step
+            and step.normalized_command == previous_step.normalized_command
+            and output_similarity(step.output, previous_step.output) >= self.loop_similarity_threshold
         ):
             reason_codes.append("loop")
             state.remember_blocked_command(step.command)
@@ -772,19 +922,40 @@ class OSMonitor:
             reason_codes.append("loop")
             state.remember_blocked_command(step.command)
 
+        suppress_empty_signal = (
+            not step.informative
+            and not step.error_tags
+            and (
+                step.command_type in {"mutation", "mixed"}
+                or _looks_like_setup_or_bootstrap(step.command)
+            )
+        )
+
         if (
-                step.command_type in {"inspection", "mixed", "unknown"}
-                and not step.informative
-                and _command_complexity(step.command) >= 2
+            step.command_type in {"inspection", "mixed", "unknown"}
+            and not step.informative
+            and _command_complexity(step.command) >= 2
+            and not suppress_empty_signal
         ):
             reason_codes.append("complex_empty")
 
         recent_window = state.recent_steps[-4:]
         suspicious_count = sum(1 for record in recent_window if record.suspicious)
-        if len(recent_window) >= 3 and suspicious_count >= 3:
-            reason_codes.append("stall")
-        elif len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
-            reason_codes.append("stall")
+
+        if task_mode == "answer":
+            if len(recent_window) >= 3 and suspicious_count >= 3 and not state.has_productive_observation():
+                reason_codes.append("stall")
+            elif (
+                len(state.recent_steps) >= 2
+                and all(record.suspicious for record in state.recent_steps[-2:])
+                and not state.has_productive_observation()
+            ):
+                reason_codes.append("stall")
+        else:
+            if len(recent_window) >= 3 and suspicious_count >= 3:
+                reason_codes.append("stall")
+            elif len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
+                reason_codes.append("stall")
 
         return self._dedupe(reason_codes)
 
