@@ -8,7 +8,7 @@ from pathlib import Path
 QUERY_HINTS = (
     "how many", "what is", "tell me", "full path", "find out", "determine",
     "calculate", "count", "single integer", "answer as an integer", "yes or no",
-    "what will be the output", "locate"
+    "what will be the output", "locate", "maximum", "max number", "min number"
 )
 
 PROTOCOL_HINTS = (
@@ -47,27 +47,22 @@ def compact_ranges(indices: list[int]) -> list[str]:
     out.append(f"{start}-{prev}" if start != prev else str(start))
     return out
 
-def load_trace_text(run_dir: Path, idx: int) -> str:
-    candidates = [
-        run_dir / str(idx) / "trace.json",
-        run_dir / str(idx) / "messages.json",
-    ]
-    for p in candidates:
-        if p.exists():
-            try:
-                return p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                pass
-    for p in run_dir.rglob("trace.json"):
-        if p.parent.name == str(idx):
-            try:
-                return p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                pass
-    return ""
-
 def entry_index(entry: dict) -> int | None:
-    for key in ("index", "idx", "sample_index"):
+    # your results.jsonl uses: "index":{"int_value":27,"str_value":null}
+    idx = entry.get("index")
+    if isinstance(idx, dict):
+        if idx.get("int_value") is not None:
+            try:
+                return int(idx["int_value"])
+            except Exception:
+                pass
+        if idx.get("str_value") is not None:
+            try:
+                return int(idx["str_value"])
+            except Exception:
+                pass
+
+    for key in ("idx", "sample_index"):
         if key in entry:
             try:
                 return int(entry[key])
@@ -76,22 +71,41 @@ def entry_index(entry: dict) -> int | None:
     return None
 
 def entry_status(entry: dict) -> str:
-    for key in ("status", "sample_status", "result"):
-        if key in entry:
-            return str(entry[key]).lower()
-    return ""
+    return str(entry.get("status", "")).lower()
 
 def entry_success(entry: dict) -> bool | None:
-    for key in ("success", "passed", "completed"):
-        if key in entry and isinstance(entry[key], bool):
-            return entry[key]
-    reward = entry.get("reward")
-    if isinstance(reward, (int, float)):
-        if reward == 1:
-            return True
-        if reward == 0:
-            return False
+    # your results.jsonl uses metric_reward 1.0 / 0.0
+    for key in ("metric_reward", "metric_score", "metric_success_rate", "reward"):
+        val = entry.get(key)
+        if isinstance(val, (int, float)):
+            if val == 1:
+                return True
+            if val == 0:
+                return False
     return None
+
+def trace_path(run_dir: Path, entry: dict) -> Path | None:
+    raw = entry.get("raw_trace")
+    if isinstance(raw, str) and raw:
+        p = run_dir / raw
+        if p.exists():
+            return p
+    idx = entry_index(entry)
+    if idx is None:
+        return None
+    for p in run_dir.rglob("trace.json"):
+        if p.parent.name.startswith(f"{idx}-"):
+            return p
+    return None
+
+def load_trace_text(run_dir: Path, entry: dict) -> str:
+    p = trace_path(run_dir, entry)
+    if p and p.exists():
+        try:
+            return p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return ""
 
 def failed(entry: dict) -> bool:
     success = entry_success(entry)
@@ -100,34 +114,34 @@ def failed(entry: dict) -> bool:
         return True
     if any(k in status for k in ("task error", "model error", "server error", "task limit reached", "failed")):
         return True
-    reward = entry.get("reward")
-    if isinstance(reward, (int, float)) and reward == 0:
-        return True
     return False
 
 def likely_improved(entry: dict, run_dir: Path) -> bool:
-    idx = entry_index(entry)
-    if idx is None:
-        return False
-
     status = entry_status(entry)
     success = entry_success(entry)
     if success is True:
         return False
 
-    text = json.dumps(entry, ensure_ascii=False).lower()
+    # engineering failures: likely worth rerunning after task.py / monitor fixes
     if any(k in status for k in ("task error", "model error", "server error")):
         return True
+
     if "task limit reached" in status:
         return True
 
-    trace = load_trace_text(run_dir, idx).lower()
+    text = json.dumps(entry, ensure_ascii=False).lower()
+    trace = load_trace_text(run_dir, entry).lower()
     hay = text + "\n" + trace
 
+    # query-like tasks that were still treated as state-change task
     if any(q in hay for q in QUERY_HINTS) and "task type: state-change task" in hay:
         return True
-    if sum(1 for h in OVER_INTERVENTION_HINTS if h in hay) >= 2:
+
+    # monitor too chatty / over-intervention
+    if hay.count("[working plan]") >= 4 or hay.count("[monitor] recovery required.") >= 2:
         return True
+
+    # protocol / multi-tool-call issues
     if any(p in hay for p in PROTOCOL_HINTS):
         return True
 
@@ -150,7 +164,9 @@ def main():
         raise SystemExit(f"Could not find {results_jsonl}")
 
     chosen = []
+    total = 0
     for entry in read_jsonl(results_jsonl):
+        total += 1
         idx = entry_index(entry)
         if idx is None:
             continue

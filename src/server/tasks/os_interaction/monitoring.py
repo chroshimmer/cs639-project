@@ -31,11 +31,14 @@ _INSPECTION_HINTS = (
     "whereis",
     "file",
     "printf",
+    "du",
+    "realpath",
 )
 
 _MUTATION_HINTS = (
     "chmod",
     "chown",
+    "chgrp",
     "touch",
     "mkdir",
     "rm",
@@ -44,17 +47,39 @@ _MUTATION_HINTS = (
     "ln",
     "tee",
     "sed -i",
-    "python",
-    "python3",
-    "perl",
     "patch",
-    "git",
-    "tar",
-    "unzip",
-    "service",
-    "systemctl",
-    "kill",
-    "pkill",
+    "groupadd",
+    "groupmod",
+    "useradd",
+    "usermod",
+    "userdel",
+    "setfacl",
+)
+
+_STATE_CHANGE_PATTERNS = (
+    r"\bchmod\b",
+    r"\bchown\b",
+    r"\bchgrp\b",
+    r"\btouch\b",
+    r"\bmkdir\b",
+    r"\brm\b",
+    r"\bmv\b",
+    r"\bcp\b",
+    r"\bln\b",
+    r"\btee\b",
+    r"\bsed\s+-i\b",
+    r"\bpatch\b",
+    r"\bgroupadd\b",
+    r"\bgroupmod\b",
+    r"\buseradd\b",
+    r"\busermod\b",
+    r"\buserdel\b",
+    r"\bsetfacl\b",
+    r"\binstall\b",
+    r"\bapt(?:-get)?\s+install\b",
+    r"\b(?:yum|dnf|pip|pip3)\s+install\b",
+    r"\bsystemctl\s+(?:start|stop|restart|reload|enable|disable|daemon-reload)\b",
+    r"\bservice\s+\S+\s+(?:start|stop|restart|reload)\b",
 )
 
 _VERIFICATION_HINTS = (
@@ -199,9 +224,13 @@ def _has_shell_hint(normalized_command: str, hint: str) -> bool:
 
 def _classify_command(command: str) -> str:
     lowered = normalize_command(command).lower()
-    has_mutation = any(_has_shell_hint(lowered, hint) for hint in _MUTATION_HINTS)
-    has_mutation = has_mutation or bool(re.search(r"(^|[^0-9])>>?\s*[^&\s]", command or ""))
     has_inspection = any(_has_shell_hint(lowered, hint) for hint in _INSPECTION_HINTS)
+
+    has_mutation = any(re.search(pattern, lowered) for pattern in _STATE_CHANGE_PATTERNS)
+    has_mutation = has_mutation or _contains_file_write_redirection(command)
+
+    if _looks_like_pure_diagnostic_script(command):
+        has_mutation = False
 
     if has_mutation and has_inspection:
         return "mixed"
@@ -270,6 +299,35 @@ def _looks_like_setup_or_bootstrap(command: str) -> bool:
         "mktemp",
     )
     return any(hint in cmd for hint in hints)
+
+
+def _contains_file_write_redirection(command: str) -> bool:
+    cmd = command or ""
+    if re.search(r"(^|[;\n])\s*(?:cat|printf|echo|awk|sed|perl|python|python3)\b[^\n]*>(?![&0-9])\s*\S+", cmd):
+        return True
+    if re.search(r"(^|[;\n])\s*>\s*\S+", cmd):
+        return True
+    return False
+
+
+def _is_large_multiline_script(command: str) -> bool:
+    cmd = command or ""
+    line_count = cmd.count("\n") + 1
+    return len(cmd) > 350 or line_count > 10 or _command_complexity(cmd) > 14
+
+
+def _looks_like_pure_diagnostic_script(command: str) -> bool:
+    cmd = normalize_command(command).lower()
+    if _contains_file_write_redirection(command):
+        return False
+    if any(re.search(pattern, cmd) for pattern in _STATE_CHANGE_PATTERNS):
+        return False
+    diag_hints = (
+        "whoami", "id", "groups", "ls", "stat", "find", "grep", "cat", "head", "tail",
+        "wc", "pwd", "which", "whereis", "command -v", "getent", "readlink", "realpath",
+        "sudo -n", "sudo -l", "systemctl status",
+    )
+    return _is_large_multiline_script(command) and any(hint in cmd for hint in diag_hints)
 
 
 @dataclass
@@ -849,6 +907,55 @@ class OSMonitor:
     def create_state(self, goal: str, evaluation_type: str) -> TrajectoryState:
         return TrajectoryState(goal=goal, evaluation_type=evaluation_type)
 
+    def infer_task_mode(self, goal: str, evaluation_type: str = "check") -> str:
+        return self.replanner._infer_task_mode_from_goal(goal)
+
+    def build_initial_hint(self, goal: str, evaluation_type: str = "check") -> Optional[str]:
+        if not self.enabled:
+            return None
+        task_mode = self.infer_task_mode(goal, evaluation_type)
+        if task_mode == "answer":
+            return (
+                "[Task hint]\n"
+                "This is mainly an answer/query task. Prefer one short read-only command at a time. "
+                "Avoid long multi-line scripts. As soon as shell output contains the exact answer, call answer_action."
+            )
+        if task_mode == "hybrid":
+            return (
+                "[Task hint]\n"
+                "This task mixes implementation and answering. Make the minimal required change first, then verify it, "
+                "then return the final grounded value/path/output. Avoid oversized diagnostic scripts."
+            )
+        return (
+            "[Task hint]\n"
+            "This is mainly a state-change task. Prefer minimal changes and short verification commands. "
+            "Avoid large diagnostic scripts unless a short check already failed."
+        )
+
+    def should_block_complex_bash(self, state: TrajectoryState, command: str) -> Optional[str]:
+        if not self.enabled:
+            return None
+        task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
+        phase = self.replanner._infer_phase(state)
+        if not _is_large_multiline_script(command):
+            return None
+        if task_mode == "answer":
+            return (
+                "[Monitor] This bash script is too large for a query task. "
+                "Use one short read-only command next, and avoid multi-line scripts or set -euo pipefail."
+            )
+        if task_mode == "hybrid" and phase in {"diagnose", "answer"}:
+            return (
+                "[Monitor] The current step is too large. Narrow the task with one short command first. "
+                "Only use a larger implementation command after the target/output is clear."
+            )
+        if task_mode == "state" and phase == "diagnose":
+            return (
+                "[Monitor] The diagnostic script is too large. Use one short command to narrow the issue first, "
+                "then mutate or verify."
+            )
+        return None
+
     def build_memory_card(self, state: TrajectoryState) -> Optional[str]:
         if not self.enabled:
             return None
@@ -876,6 +983,7 @@ class OSMonitor:
             command_type in {"inspection", "unknown"}
             and not informative
             and not suppress_empty_signal
+            and not _looks_like_pure_diagnostic_script(command)
         )
 
         step = StepRecord(
@@ -894,7 +1002,8 @@ class OSMonitor:
         state.add_step(step)
         state.add_paths(_extract_paths(command, output))
 
-        if command_type in {"mutation", "mixed"}:
+        mutation_like = command_type in {"mutation", "mixed"} and not _looks_like_pure_diagnostic_script(command)
+        if mutation_like:
             state.last_mutation_round = round_id
             state.last_verification_round = None
         elif command_type in {"inspection", "unknown"} and informative:
@@ -1011,10 +1120,12 @@ class OSMonitor:
             state.remember_blocked_command(step.command)
 
         if (
-            step.command_type in {"inspection", "unknown"}
+            step.round_id >= 2
+            and step.command_type in {"inspection", "unknown"}
             and not step.informative
             and not step.error_tags
             and not _looks_like_setup_or_bootstrap(step.command)
+            and not _looks_like_pure_diagnostic_script(step.command)
             and _command_complexity(step.command) >= 2
         ):
             reason_codes.append("complex_empty")
@@ -1024,9 +1135,9 @@ class OSMonitor:
         if len(recent_window) >= 4 and suspicious_count >= 4:
             reason_codes.append("stall")
         elif (
-            len(state.recent_steps) >= 3
-            and all(record.suspicious for record in state.recent_steps[-3:])
-            and not any(record.informative and not record.error_tags for record in state.recent_steps[-3:])
+            len(state.recent_steps) >= 4
+            and all(record.suspicious for record in state.recent_steps[-4:])
+            and not any(record.informative and not record.error_tags for record in state.recent_steps[-4:])
         ):
             reason_codes.append("stall")
 
