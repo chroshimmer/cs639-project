@@ -547,10 +547,44 @@ Always use a tool provided instead of simply responding with content."""
             content=f'Now, I will start a new problem in a new OS. My problem is:\n\n{description}'
         ))
 
+    def _coerce_response_content_text(self, content: Any) -> Optional[str]:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        parts.append(text)
+            return "\n".join(part for part in parts if part) or None
+        if isinstance(content, dict):
+            return content.get("text") or None
+        return str(content)
+
+    def _should_inject_memory(self, state: TrajectoryState, round_num: int) -> bool:
+        if round_num == 0 or not state.recent_steps:
+            return False
+
+        latest = state.recent_steps[-1]
+        if latest.error_tags:
+            return True
+        if latest.command_type in {"mutation", "mixed"} and not state.has_verification_after_mutation():
+            return True
+        if state.last_intervention_round is not None and (round_num - state.last_intervention_round) <= 1:
+            return True
+        if round_num % 3 == 0:
+            return True
+        return False
+
     def _inject_state_memory(
             self, session: Session, state: TrajectoryState, round_num: int
     ) -> None:
-        if round_num == 0:
+        if not self._should_inject_memory(state, round_num):
             return
         memory_card = self.monitor.build_memory_card(state)
         if memory_card:
@@ -610,9 +644,12 @@ Always use a tool provided instead of simply responding with content."""
         # 提取工具调用
         response_content = None
         tool_calls = []
-        for message in response.messages:
-            if not response_content:
-                response_content = message.get('content')
+        messages = getattr(response, "messages", None) or []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if response_content is None:
+                response_content = self._coerce_response_content_text(message.get('content'))
             tool_calls.extend(message.get('tool_calls', []) or [])
 
         # 检查是否有有效的工具调用
@@ -620,11 +657,27 @@ Always use a tool provided instead of simply responding with content."""
             logging.warning("Empty tool calls array")
             session.inject(ChatCompletionUserMessageParam(
                 role='user',
-                content="No executable tool calls found. Please call a tool instead"
+                content="No executable tool calls found. Please call a single tool instead."
             ))
             round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
             session.inject(round_rewardhistory)
             return result
+
+        if len(tool_calls) > 1:
+            logging.warning(f"Multiple tool calls detected in one turn: {len(tool_calls)}")
+            for ignored_tool_call in tool_calls[1:]:
+                ignored_id = ignored_tool_call.get("id")
+                if ignored_id:
+                    session.inject(ChatCompletionToolMessageParam(
+                        role='tool',
+                        content="Only one tool call is allowed per turn. This tool call was ignored.",
+                        tool_call_id=ignored_id,
+                    ))
+            session.inject(ChatCompletionUserMessageParam(
+                role='user',
+                content="Only one tool call is allowed per turn. Continue with a single tool call next."
+            ))
+            tool_calls = tool_calls[:1]
 
         # 获取第一个工具调用
         tool_call = tool_calls[0]
@@ -636,18 +689,19 @@ Always use a tool provided instead of simply responding with content."""
         try:
             arguments = tool_call["function"]["arguments"]
             arguments = json.loads(arguments)
-            if not response_content and 'thought' in arguments:
+            if not response_content and isinstance(arguments, dict) and 'thought' in arguments:
                 response_content = arguments['thought']
-            arguments = list(arguments.values())
+            arguments = list(arguments.values()) if isinstance(arguments, dict) else [arguments]
         except Exception as e:
             logging.error(f"Error parsing arguments: {str(e)}")
             call_id = tool_call.get("id")
             result["id"] = call_id
-            session.inject(ChatCompletionToolMessageParam(
-                role='tool',
-                content=str(e),
-                tool_call_id=call_id
-            ))
+            if call_id:
+                session.inject(ChatCompletionToolMessageParam(
+                    role='tool',
+                    content=str(e),
+                    tool_call_id=call_id
+                ))
             round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
             session.inject(round_rewardhistory)
             return result
@@ -699,13 +753,17 @@ Always use a tool provided instead of simply responding with content."""
         # 执行bash命令
         elif action == "bash":
             bash_info = await self._execute_bash_command(session, container, content, call_id)
-            _, intervention = self.monitor.record_bash(
-                state,
-                round_num,
-                content,
-                bash_info["output_text"],
-                output_was_truncated=bash_info["output_was_truncated"],
-            )
+            try:
+                _, intervention = self.monitor.record_bash(
+                    state,
+                    round_num,
+                    content,
+                    bash_info["output_text"],
+                    output_was_truncated=bash_info["output_was_truncated"],
+                )
+            except Exception:
+                logging.exception("Monitor record_bash failed")
+                intervention = None
             if intervention:
                 logging.info(f"Monitor injected replanning prompt: {intervention.summary}")
                 self._apply_monitor_intervention(session, intervention)
@@ -722,8 +780,20 @@ Always use a tool provided instead of simply responding with content."""
         """执行bash命令并处理结果"""
         logging.info("Executing bash command")
 
-        # 执行命令
-        result = await container.execute(command)
+        try:
+            result = await container.execute(command)
+        except Exception as e:
+            logging.exception("Error executing bash command")
+            result_text = f"OS execution failed: {str(e)}"
+            session.inject(ChatCompletionToolMessageParam(
+                role='tool',
+                content=f'The output of the OS:\n\n{result_text}',
+                tool_call_id=id
+            ))
+            return {
+                "output_text": result_text,
+                "output_was_truncated": False,
+            }
 
         # 解码输出
         try:
