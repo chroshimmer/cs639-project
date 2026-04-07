@@ -410,12 +410,13 @@ class OSInteraction(Task):
         if setup_result:
             return setup_result
 
-        # 注入初始消息
-        self._inject_initial_messages(session, config.description)
         state = self.monitor.create_state(
             goal=config.description,
             evaluation_type=config.get_evaluation_type(),
         )
+
+        # 注入初始消息
+        self._inject_initial_messages(session, config.description, state)
 
         # 初始化状态变量
         finish = False
@@ -525,14 +526,16 @@ class OSInteraction(Task):
         logging.info("Execution setup completed successfully")
         return None
 
-    def _inject_initial_messages(self, session: Session, description: str) -> None:
+    def _inject_initial_messages(self, session: Session, description: str, state: TrajectoryState) -> None:
         """注入系统消息和问题描述"""
-        # 系统消息
         system_message = """You are an assistant that will act like a person. I will play the role of a Linux (Ubuntu) operating system.
 Your goal is to implement the operations required by me or answer the questions proposed by me.
 For each of your turns, you should first think about what you should do, and then call exactly one of the provided tools according to the situation.
 If you think the output is too long, I will truncate it. The truncated output is not complete. You have to deal with the truncating problem by yourself.
 Attention, your bash code should not contain any input operation. Once again, you should use one tool in each turn, and should not respond without function calling.
+Prefer short, simple bash commands. Avoid large multi-line scripts unless the task explicitly asks you to create a script or file.
+For query tasks, prefer one short read-only command; as soon as shell output contains the exact answer, call answer_action immediately.
+For state-change tasks, prefer one minimal change and then one short verification command.
 Note that if you think the task has been finished, or there is some message missing to completely complete the task, you should respond with calling the function "finish_action", as no additional information will be provided.
 Also, note that if you have gotten the answer to the question, you should call the "answer_action" tool instead of simply writing your answer in your response.
 Your answers should be exact and precise (for example, a single number), do not answer with full sentences or phrases.
@@ -546,11 +549,110 @@ Always use a tool provided instead of simply responding with content."""
             role='user',
             content=f'Now, I will start a new problem in a new OS. My problem is:\n\n{description}'
         ))
+        initial_hint = self.monitor.build_initial_hint(state.goal, state.evaluation_type)
+        if initial_hint:
+            session.inject(ChatCompletionUserMessageParam(
+                role='user',
+                content=initial_hint,
+            ))
 
+    def _coerce_response_content_text(self, content: Any) -> Optional[str]:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        parts.append(text)
+            return "\n".join(part for part in parts if part) or None
+        if isinstance(content, dict):
+            return content.get("text") or None
+        return str(content)
+
+    def _extract_response_payload(self, response: Any) -> Tuple[Optional[str], List[dict]]:
+        response_content = None
+        tool_calls: List[dict] = []
+        messages = getattr(response, "messages", None) or []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+
+            role = message.get("role")
+            item_type = message.get("type")
+
+            if response_content is None and role == "assistant":
+                response_content = self._coerce_response_content_text(message.get("content"))
+
+            if role == "assistant":
+                tool_calls.extend(message.get("tool_calls", []) or [])
+
+            if item_type == "function_call":
+                tool_calls.append({
+                    "id": message.get("call_id") or message.get("id"),
+                    "function": {
+                        "name": message.get("name"),
+                        "arguments": message.get("arguments"),
+                    },
+                })
+            elif response_content is None and message.get("content"):
+                response_content = self._coerce_response_content_text(message.get("content"))
+
+        return response_content, tool_calls
+
+    @staticmethod
+    def _extract_atomic_answer(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        cleaned = text.strip().strip("`").strip()
+        if not cleaned:
+            return None
+
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) == 1:
+            candidate = lines[0]
+            if len(candidate) <= 80:
+                return candidate
+
+        if len(lines) == 2 and lines[0].lower().startswith("answer:") and len(lines[1]) <= 80:
+            return lines[1]
+
+        return None
+
+    def _should_auto_answer(self, state: TrajectoryState, response_text: Optional[str]) -> Optional[str]:
+        candidate = self._extract_atomic_answer(response_text)
+        if not candidate:
+            return None
+        task_mode = self.monitor.infer_task_mode(state.goal, state.evaluation_type)
+        if task_mode == "state":
+            return None
+        if not state.has_productive_observation():
+            return None
+        return candidate
+
+    def _should_inject_memory(self, state: TrajectoryState, round_num: int) -> bool:
+        if round_num <= 1 or not state.recent_steps:
+            return False
+
+        latest = state.recent_steps[-1]
+        if state.last_intervention_round is not None and (round_num - state.last_intervention_round) <= 1:
+            return True
+        if latest.error_tags:
+            return True
+        if latest.command_type in {"mutation", "mixed"} and not state.has_verification_after_mutation():
+            return True
+        if len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
+            return True
+        return False
     def _inject_state_memory(
             self, session: Session, state: TrajectoryState, round_num: int
     ) -> None:
-        if round_num == 0:
+        if not self._should_inject_memory(state, round_num):
             return
         memory_card = self.monitor.build_memory_card(state)
         if memory_card:
@@ -608,23 +710,44 @@ Always use a tool provided instead of simply responding with content."""
         }
 
         # 提取工具调用
-        response_content = None
-        tool_calls = []
-        for message in response.messages:
-            if not response_content:
-                response_content = message.get('content')
-            tool_calls.extend(message.get('tool_calls', []) or [])
+        response_content, tool_calls = self._extract_response_payload(response)
 
         # 检查是否有有效的工具调用
         if len(tool_calls) == 0:
+            auto_answer = self._should_auto_answer(state, response_content)
+            if auto_answer is not None:
+                logging.info("Auto-converting plain text response into grounded answer")
+                result["answer"] = auto_answer
+                result["finish"] = True
+                round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
+                session.inject(round_rewardhistory)
+                return result
+
             logging.warning("Empty tool calls array")
             session.inject(ChatCompletionUserMessageParam(
                 role='user',
-                content="No executable tool calls found. Please call a tool instead"
+                content="No executable tool calls found. Please call a single tool. If you already know the exact answer, call answer_action."
             ))
             round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
             session.inject(round_rewardhistory)
             return result
+
+        if len(tool_calls) > 1:
+            logging.warning(f"Multiple tool calls detected in one turn: {len(tool_calls)}")
+            # Important: every tool_call from the same assistant turn must receive a tool message
+            # before any new user message is injected, otherwise the OpenAI tool-call protocol breaks.
+            for ignored_tool_call in tool_calls[1:]:
+                ignored_id = ignored_tool_call.get("id") or ignored_tool_call.get("call_id")
+                if ignored_id:
+                    session.inject(ChatCompletionToolMessageParam(
+                        role='tool',
+                        content="Only one tool call is allowed per turn. This tool call was ignored.",
+                        tool_call_id=ignored_id,
+                    ))
+            # Keep only the first tool call for actual execution. We intentionally do not inject
+            # a user reminder here, because doing so before responding to the first tool_call_id
+            # would violate the tool-call protocol.
+            tool_calls = tool_calls[:1]
 
         # 获取第一个工具调用
         tool_call = tool_calls[0]
@@ -636,18 +759,19 @@ Always use a tool provided instead of simply responding with content."""
         try:
             arguments = tool_call["function"]["arguments"]
             arguments = json.loads(arguments)
-            if not response_content and 'thought' in arguments:
+            if not response_content and isinstance(arguments, dict) and 'thought' in arguments:
                 response_content = arguments['thought']
-            arguments = list(arguments.values())
+            arguments = list(arguments.values()) if isinstance(arguments, dict) else [arguments]
         except Exception as e:
             logging.error(f"Error parsing arguments: {str(e)}")
-            call_id = tool_call.get("id")
+            call_id = tool_call.get("id") or tool_call.get("call_id")
             result["id"] = call_id
-            session.inject(ChatCompletionToolMessageParam(
-                role='tool',
-                content=str(e),
-                tool_call_id=call_id
-            ))
+            if call_id:
+                session.inject(ChatCompletionToolMessageParam(
+                    role='tool',
+                    content=str(e),
+                    tool_call_id=call_id
+                ))
             round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
             session.inject(round_rewardhistory)
             return result
@@ -698,17 +822,38 @@ Always use a tool provided instead of simply responding with content."""
                 result["finish"] = True
         # 执行bash命令
         elif action == "bash":
-            bash_info = await self._execute_bash_command(session, container, content, call_id)
-            _, intervention = self.monitor.record_bash(
-                state,
-                round_num,
-                content,
-                bash_info["output_text"],
-                output_was_truncated=bash_info["output_was_truncated"],
-            )
-            if intervention:
-                logging.info(f"Monitor injected replanning prompt: {intervention.summary}")
-                self._apply_monitor_intervention(session, intervention)
+            complex_guard = self.monitor.should_block_complex_bash(state, content)
+            if complex_guard:
+                logging.info("Monitor blocked oversized bash script before execution")
+                # Respond to the pending tool_call_id first, then inject the follow-up user hint.
+                session.inject(ChatCompletionToolMessageParam(
+                    role='tool',
+                    content=(
+                        "The requested bash step was blocked by the monitor before execution. "
+                        "Please use a smaller, simpler next step."
+                    ),
+                    tool_call_id=call_id,
+                ))
+                session.inject(ChatCompletionUserMessageParam(
+                    role='user',
+                    content=complex_guard,
+                ))
+            else:
+                bash_info = await self._execute_bash_command(session, container, content, call_id)
+                try:
+                    _, intervention = self.monitor.record_bash(
+                        state,
+                        round_num,
+                        content,
+                        bash_info["output_text"],
+                        output_was_truncated=bash_info["output_was_truncated"],
+                    )
+                except Exception:
+                    logging.exception("Monitor record_bash failed")
+                    intervention = None
+                if intervention:
+                    logging.info(f"Monitor injected replanning prompt: {intervention.summary}")
+                    self._apply_monitor_intervention(session, intervention)
 
         # 注入回合奖励
         round_rewardhistory = RewardHistoryItem(reward=round_reward, score=0)
@@ -722,8 +867,20 @@ Always use a tool provided instead of simply responding with content."""
         """执行bash命令并处理结果"""
         logging.info("Executing bash command")
 
-        # 执行命令
-        result = await container.execute(command)
+        try:
+            result = await container.execute(command)
+        except Exception as e:
+            logging.exception("Error executing bash command")
+            result_text = f"OS execution failed: {str(e)}"
+            session.inject(ChatCompletionToolMessageParam(
+                role='tool',
+                content=f'The output of the OS:\n\n{result_text}',
+                tool_call_id=id
+            ))
+            return {
+                "output_text": result_text,
+                "output_was_truncated": False,
+            }
 
         # 解码输出
         try:

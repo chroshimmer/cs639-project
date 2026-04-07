@@ -31,11 +31,14 @@ _INSPECTION_HINTS = (
     "whereis",
     "file",
     "printf",
+    "du",
+    "realpath",
 )
 
 _MUTATION_HINTS = (
     "chmod",
     "chown",
+    "chgrp",
     "touch",
     "mkdir",
     "rm",
@@ -44,17 +47,39 @@ _MUTATION_HINTS = (
     "ln",
     "tee",
     "sed -i",
-    "python",
-    "python3",
-    "perl",
     "patch",
-    "git",
-    "tar",
-    "unzip",
-    "service",
-    "systemctl",
-    "kill",
-    "pkill",
+    "groupadd",
+    "groupmod",
+    "useradd",
+    "usermod",
+    "userdel",
+    "setfacl",
+)
+
+_STATE_CHANGE_PATTERNS = (
+    r"\bchmod\b",
+    r"\bchown\b",
+    r"\bchgrp\b",
+    r"\btouch\b",
+    r"\bmkdir\b",
+    r"\brm\b",
+    r"\bmv\b",
+    r"\bcp\b",
+    r"\bln\b",
+    r"\btee\b",
+    r"\bsed\s+-i\b",
+    r"\bpatch\b",
+    r"\bgroupadd\b",
+    r"\bgroupmod\b",
+    r"\buseradd\b",
+    r"\busermod\b",
+    r"\buserdel\b",
+    r"\bsetfacl\b",
+    r"\binstall\b",
+    r"\bapt(?:-get)?\s+install\b",
+    r"\b(?:yum|dnf|pip|pip3)\s+install\b",
+    r"\bsystemctl\s+(?:start|stop|restart|reload|enable|disable|daemon-reload)\b",
+    r"\bservice\s+\S+\s+(?:start|stop|restart|reload)\b",
 )
 
 _VERIFICATION_HINTS = (
@@ -149,6 +174,11 @@ _REASON_TEXT = {
     "no_grounding_for_answer": "the answer is not grounded in a clear observation yet",
 }
 
+_REASON_TEXT.update({
+    "finish_on_answer_task": "this task asks for a grounded answer, so finishing without returning the answer is unsafe",
+    "hybrid_answer_pending": "the implementation looks incomplete or the final output is not yet grounded",
+})
+
 
 def normalize_command(command: str) -> str:
     return " ".join((command or "").strip().split())
@@ -194,9 +224,13 @@ def _has_shell_hint(normalized_command: str, hint: str) -> bool:
 
 def _classify_command(command: str) -> str:
     lowered = normalize_command(command).lower()
-    has_mutation = any(_has_shell_hint(lowered, hint) for hint in _MUTATION_HINTS)
-    has_mutation = has_mutation or bool(re.search(r"(^|[^0-9])>>?\s*[^&\s]", command or ""))
     has_inspection = any(_has_shell_hint(lowered, hint) for hint in _INSPECTION_HINTS)
+
+    has_mutation = any(re.search(pattern, lowered) for pattern in _STATE_CHANGE_PATTERNS)
+    has_mutation = has_mutation or _contains_file_write_redirection(command)
+
+    if _looks_like_pure_diagnostic_script(command):
+        has_mutation = False
 
     if has_mutation and has_inspection:
         return "mixed"
@@ -267,6 +301,35 @@ def _looks_like_setup_or_bootstrap(command: str) -> bool:
     return any(hint in cmd for hint in hints)
 
 
+def _contains_file_write_redirection(command: str) -> bool:
+    cmd = command or ""
+    if re.search(r"(^|[;\n])\s*(?:cat|printf|echo|awk|sed|perl|python|python3)\b[^\n]*>(?![&0-9])\s*\S+", cmd):
+        return True
+    if re.search(r"(^|[;\n])\s*>\s*\S+", cmd):
+        return True
+    return False
+
+
+def _is_large_multiline_script(command: str) -> bool:
+    cmd = command or ""
+    line_count = cmd.count("\n") + 1
+    return len(cmd) > 350 or line_count > 10 or _command_complexity(cmd) > 14
+
+
+def _looks_like_pure_diagnostic_script(command: str) -> bool:
+    cmd = normalize_command(command).lower()
+    if _contains_file_write_redirection(command):
+        return False
+    if any(re.search(pattern, cmd) for pattern in _STATE_CHANGE_PATTERNS):
+        return False
+    diag_hints = (
+        "whoami", "id", "groups", "ls", "stat", "find", "grep", "cat", "head", "tail",
+        "wc", "pwd", "which", "whereis", "command -v", "getent", "readlink", "realpath",
+        "sudo -n", "sudo -l", "systemctl status",
+    )
+    return _is_large_multiline_script(command) and any(hint in cmd for hint in diag_hints)
+
+
 @dataclass
 class StepRecord:
     round_id: int
@@ -329,10 +392,42 @@ class MonitorIntervention:
     tool_message: Optional[str] = None
 
 
+
 class OSReplanner:
     def _infer_task_mode_from_goal(self, goal: str) -> str:
         goal_l = (goal or "").lower()
 
+        strong_impl_patterns = (
+            "write a bash script",
+            "write a shell script",
+            "implement a command line tool",
+            "implement command line tool",
+            "implement ",
+            "create a directory",
+            "generate ",
+            "set all files",
+            "set all directories",
+            "fix ",
+            "make ",
+            "permission",
+            "read-only",
+            "readable",
+            "writable",
+            "rename ",
+            "modify ",
+            "change ",
+            "delete ",
+            "remove ",
+            "install ",
+            "uninstall ",
+            "append ",
+            "replace ",
+            "copy ",
+            "move ",
+            "start ",
+            "stop ",
+            "restart ",
+        )
         answer_patterns = (
             "how many",
             "what is",
@@ -349,47 +444,31 @@ class OSReplanner:
             "number of directories",
             "total occurrences",
             "sum of",
-            "print the result",
-            "respond with",
+            "tell me",
+            "full path",
             "which file",
             "which directory",
-        )
-        state_patterns = (
-            "create ",
-            "set ",
-            "change ",
-            "modify ",
-            "rename ",
-            "delete ",
-            "remove ",
-            "install ",
-            "uninstall ",
-            "start ",
-            "stop ",
-            "restart ",
-            "permission",
-            "read-only",
-            "readable",
-            "writable",
-            "move ",
-            "copy ",
-            "append ",
-            "write ",
-            "replace ",
-            "kill ",
-            "make ",
+            "what will be the output",
+            "output if i execute",
+            "max number",
+            "find out",
+            "locate ",
+            "path of",
         )
 
+        strong_impl_hit = any(pattern in goal_l for pattern in strong_impl_patterns)
         answer_hit = any(pattern in goal_l for pattern in answer_patterns)
-        state_hit = any(pattern in goal_l for pattern in state_patterns)
 
-        if answer_hit and not state_hit:
-            return "answer"
-        if state_hit and not answer_hit:
+        if strong_impl_hit and answer_hit:
+            return "hybrid"
+        if strong_impl_hit:
             return "state"
         if answer_hit:
             return "answer"
-        if "integer" in goal_l or "answer" in goal_l or "count" in goal_l:
+
+        if "script" in goal_l or "tool" in goal_l:
+            return "state"
+        if "path" in goal_l or "output" in goal_l or "count" in goal_l or "integer" in goal_l:
             return "answer"
         return "state"
 
@@ -407,13 +486,31 @@ class OSReplanner:
                 return "diagnose"
             return "answer"
 
-        if state.last_mutation_round is not None and not state.has_verification_after_mutation():
+        if task_mode == "hybrid":
+            if state.last_mutation_round is None:
+                if latest.error_tags:
+                    return "diagnose"
+                return "mutate"
+            if not state.has_verification_after_mutation():
+                return "verify"
+            if latest.error_tags:
+                return "diagnose"
+            if state.has_productive_observation():
+                return "answer"
+            return "diagnose"
+
+        # state task
+        if state.last_mutation_round is None:
+            if latest.error_tags:
+                return "diagnose"
+            if latest.command_type in {"inspection", "unknown"} and not state.has_productive_observation():
+                return "diagnose"
+            return "mutate"
+
+        if not state.has_verification_after_mutation():
             return "verify"
 
         if latest.error_tags:
-            return "diagnose"
-
-        if not state.has_productive_observation():
             return "diagnose"
 
         return "mutate"
@@ -436,11 +533,11 @@ class OSReplanner:
             if kw not in hints:
                 hints.append(kw)
 
-        deduped: List[str] = []
+        filtered = []
         for item in hints:
-            if item and item not in deduped:
-                deduped.append(item)
-        return deduped[:5]
+            if item and item not in filtered and item.lower() not in {"and", "the", "full", "path", "output"}:
+                filtered.append(item)
+        return filtered[:5]
 
     def _completed_evidence(self, state: TrajectoryState) -> List[str]:
         evidence: List[str] = []
@@ -469,22 +566,36 @@ class OSReplanner:
         if task_mode == "answer":
             if not state.has_productive_observation():
                 goals.append("collect one direct shell observation that contains the answer")
-            goals.append("extract the exact answer string/number from evidence")
+            goals.append("extract the exact answer string/number/path from evidence")
             goals.append("do not change the environment just to make the answer easier")
-            goals.append("use answer_action only after the answer is directly grounded")
+            goals.append("if the recent shell output already contains the answer, commit now")
             return goals[:4]
 
+        if task_mode == "hybrid":
+            if state.last_mutation_round is None:
+                goals.append("perform the required setup or implementation step")
+            elif not state.has_verification_after_mutation():
+                goals.append("verify that the required artifact/state now exists and behaves correctly")
+            if not state.has_productive_observation():
+                goals.append("collect one direct shell observation of the resulting output/value/path")
+            goals.append("finish only after the implementation is verified and the final output is grounded")
+            phase_hint = {
+                "diagnose": "next step should narrow uncertainty before changing anything",
+                "mutate": "next step should make one minimal required implementation change",
+                "verify": "next step should directly test the artifact you just created or changed",
+                "answer": "if the recent output already contains the requested result, commit now",
+            }
+            goals.append(phase_hint.get(phase, "next step should be simple and targeted"))
+            return goals[:4]
+
+        # state task
         if not state.has_productive_observation():
             goals.append("diagnose the current state of the target")
-
         if state.last_mutation_round is None:
             goals.append("apply exactly one state-changing command that moves toward the goal")
-
-        if state.last_mutation_round is not None and not state.has_verification_after_mutation():
+        elif not state.has_verification_after_mutation():
             goals.append("verify the final state on the same target after the mutation")
-
         goals.append("finish only after the verification output matches the task goal")
-
         phase_hint = {
             "diagnose": "next step should reduce uncertainty, not guess",
             "mutate": "next step should change only one thing, then verify",
@@ -515,12 +626,14 @@ class OSReplanner:
             return "bad_command"
         if "service_state" in latest_tags:
             return "state_mismatch"
-        if "no_grounding_for_answer" in reason_codes:
+        if "no_grounding_for_answer" in reason_codes or "finish_on_answer_task" in reason_codes:
             return "ungrounded_answer"
         if "latest_step_empty" in reason_codes or "complex_empty" in reason_codes:
             return "weak_signal"
         if task_mode == "answer":
             return "ungrounded_answer"
+        if task_mode == "hybrid":
+            return "generic_replan"
         return "generic_replan"
 
     def _typed_recovery_actions(self, failure_type: str, state: TrajectoryState) -> List[str]:
@@ -528,35 +641,58 @@ class OSReplanner:
         target_text = ", ".join(target_hints[:3]) if target_hints else "the intended target"
         task_mode = self._infer_task_mode_from_goal(state.goal)
 
-        answer_templates = {
-            "ineffective_search": [
-                "Stop broad exploration and do not repeat a blocked command.",
-                f"Run one short diagnostic command that directly answers the question about {target_text}.",
-                "Do not mutate the environment for a query-style task.",
-            ],
-            "wrong_target": [
-                "Your current target may be wrong.",
-                f"Re-identify the target first using a direct read-only check around {target_text}.",
-                "Do not mutate anything until the target identity is confirmed.",
-            ],
-            "ungrounded_answer": [
-                "The answer is not yet grounded in a direct shell observation.",
-                "Collect one exact observation that contains the final answer.",
-                "Then answer with the exact value only.",
-            ],
-            "weak_signal": [
-                "The latest evidence is weak or empty.",
-                "Use a simpler read-only command that gives direct evidence on the target.",
-                "Do not change the environment just to make the answer easier.",
-            ],
-            "generic_replan": [
-                "Re-state the question in one sentence before the next tool call.",
-                "Choose one short read-only command that directly narrows the answer.",
-                "Answer only after the result is grounded in shell output.",
-            ],
-        }
+        if task_mode == "answer":
+            templates = {
+                "ineffective_search": [
+                    "Stop broad exploration and do not repeat a blocked command.",
+                    f"Run one short diagnostic command that directly answers the question about {target_text}.",
+                    "Do not mutate the environment for a query-style task.",
+                ],
+                "wrong_target": [
+                    "Your current target may be wrong.",
+                    f"Re-identify the target first using a direct read-only check around {target_text}.",
+                    "Do not mutate anything until the target identity is confirmed.",
+                ],
+                "ungrounded_answer": [
+                    "The answer is not yet grounded in a direct shell observation.",
+                    "Collect one exact observation that contains the final answer.",
+                    "If the recent shell output already contains the answer, commit now.",
+                ],
+                "weak_signal": [
+                    "The latest evidence is weak or empty.",
+                    "Use a simpler read-only command that gives direct evidence on the target.",
+                    "Do not change the environment just to make the answer easier.",
+                ],
+                "generic_replan": [
+                    "Re-state the question in one sentence before the next tool call.",
+                    "Choose one short read-only command that directly narrows the answer.",
+                    "Commit as soon as the answer is grounded.",
+                ],
+            }
+            return templates.get(failure_type, templates["generic_replan"])
 
-        state_templates = {
+        if task_mode == "hybrid":
+            templates = {
+                "ineffective_search": [
+                    "Stop broad exploration and do not repeat a blocked command.",
+                    "Decide whether you are still implementing, verifying, or ready to return the result.",
+                    f"Choose one short command that advances only the current phase on {target_text}.",
+                ],
+                "missing_verification": [
+                    "A required implementation step likely happened, but it has not been verified yet.",
+                    f"Run one direct verification command on {target_text}.",
+                    "Once the artifact or output is verified, commit promptly.",
+                ],
+                "generic_replan": [
+                    "Re-state the remaining implementation goal before the next tool call.",
+                    "Do exactly one of these next: implement, verify, or extract the final result.",
+                    "Avoid exploratory commands that do not advance the current phase.",
+                ],
+            }
+            return templates.get(failure_type, templates["generic_replan"])
+
+        # state task
+        templates = {
             "ineffective_search": [
                 "Stop broad exploration and do not repeat a blocked command.",
                 f"Pick one target and narrow the search around {target_text}.",
@@ -587,11 +723,6 @@ class OSReplanner:
                 f"Run one direct verification command on {target_text}.",
                 "Do not finish until the verification output matches the goal.",
             ],
-            "ungrounded_answer": [
-                "The answer is not yet grounded in a direct shell observation.",
-                "Collect one exact observation that contains the final answer.",
-                "Then answer with the exact value only.",
-            ],
             "weak_signal": [
                 "The latest evidence is weak or empty.",
                 "Use a simpler command that gives direct evidence on the target.",
@@ -603,8 +734,6 @@ class OSReplanner:
                 "Prefer a simple command with direct evidence.",
             ],
         }
-
-        templates = answer_templates if task_mode == "answer" else state_templates
         return templates.get(failure_type, templates["generic_replan"])
 
     def build_memory_card(self, state: TrajectoryState) -> Optional[str]:
@@ -625,6 +754,8 @@ class OSReplanner:
 
         if task_mode == "answer":
             lines.append("Task type: answer/query task. Ground the answer in shell evidence and avoid changing the environment.")
+        elif task_mode == "hybrid":
+            lines.append("Task type: implementation-plus-answer task. First make or verify the required artifact/state, then ground the final output/value before finishing.")
         else:
             lines.append("Task type: state-change task. Change state only if needed, then verify before finish.")
 
@@ -661,24 +792,35 @@ class OSReplanner:
 
         lines.append("Next-step policy:")
         if task_mode == "answer":
-            if phase == "diagnose":
-                lines.append("- Execute exactly one short read-only diagnostic command next.")
-                lines.append("- Prefer ls/stat/find/wc/grep/cat over any state-changing command.")
+            lines.append("- Execute exactly one short read-only diagnostic command next.")
+            lines.append("- Prefer ls/stat/find/wc/grep/cat over any state-changing command.")
+            lines.append("- If recent shell output already contains the answer, commit now.")
+        elif task_mode == "hybrid":
+            if phase == "mutate":
+                lines.append("- Execute exactly one implementation step next.")
+                lines.append("- After implementation, the following step should verify the artifact or output.")
+            elif phase == "verify":
+                lines.append("- Execute exactly one direct verification or test command next.")
+                lines.append("- If the verified output already answers the question, commit now.")
+            elif phase == "answer":
+                lines.append("- If the recent shell output already contains the requested value/path/output, commit now.")
+                lines.append("- Do not perform extra changes once the implementation is verified.")
             else:
-                lines.append("- Answer only with the exact grounded result.")
-                lines.append("- Do not change the environment just to make the answer easier.")
-        elif phase == "diagnose":
-            lines.append("- Execute exactly one diagnostic command next.")
-            lines.append("- Prefer ls/stat/find/ps/systemctl status over broad search or repeated mutation.")
-        elif phase == "mutate":
-            lines.append("- Execute exactly one corrective mutation next.")
-            lines.append("- After mutation, the following step should be verification.")
-        elif phase == "verify":
-            lines.append("- Execute exactly one direct verification command on the changed target.")
-            lines.append("- Do not finish before the verification output matches the goal.")
+                lines.append("- Use one short diagnostic command to decide what is still missing.")
+                lines.append("- Avoid broad exploration that does not advance implement/verify/answer.")
         else:
-            lines.append("- Answer only with the exact grounded result.")
-            lines.append("- Do not finish without direct evidence in the recent shell output.")
+            if phase == "diagnose":
+                lines.append("- Execute exactly one diagnostic command next.")
+                lines.append("- Prefer ls/stat/find/ps/systemctl status over broad search or repeated mutation.")
+            elif phase == "mutate":
+                lines.append("- Execute exactly one corrective mutation next.")
+                lines.append("- After mutation, the following step should be verification.")
+            elif phase == "verify":
+                lines.append("- Execute exactly one direct verification command on the changed target.")
+                lines.append("- Do not finish before the verification output matches the goal.")
+            else:
+                lines.append("- Commit only with the exact grounded result.")
+                lines.append("- Do not finish without direct evidence in the recent shell output.")
 
         return "\n".join(lines)
 
@@ -713,7 +855,9 @@ class OSReplanner:
             lines.append(f"- {item}")
 
         if task_mode == "answer":
-            lines.append("Constraint: the next tool call should be read-only unless the task explicitly asks for a state change.")
+            lines.append("Constraint: the next tool call should be a single read-only diagnostic step or a grounded answer.")
+        elif task_mode == "hybrid":
+            lines.append("Constraint: the next tool call should advance exactly one phase: implement, verify, or return the grounded result.")
         else:
             lines.append("Constraint: the next tool call should perform exactly one action type: diagnose, mutate, verify, or answer.")
         return "\n".join(lines)
@@ -750,17 +894,67 @@ class OSReplanner:
         return "\n".join(lines)
 
 
+
 class OSMonitor:
     def __init__(self, config: Optional[dict] = None) -> None:
         config = config or {}
         self.enabled = bool(config.get("enabled", False))
-        self.max_interventions = int(config.get("max_interventions", 3))
-        self.cooldown_rounds = int(config.get("cooldown_rounds", 1))
+        self.max_interventions = int(config.get("max_interventions", 2))
+        self.cooldown_rounds = int(config.get("cooldown_rounds", 2))
         self.loop_similarity_threshold = float(config.get("loop_similarity_threshold", 0.88))
         self.replanner = OSReplanner()
 
     def create_state(self, goal: str, evaluation_type: str) -> TrajectoryState:
         return TrajectoryState(goal=goal, evaluation_type=evaluation_type)
+
+    def infer_task_mode(self, goal: str, evaluation_type: str = "check") -> str:
+        return self.replanner._infer_task_mode_from_goal(goal)
+
+    def build_initial_hint(self, goal: str, evaluation_type: str = "check") -> Optional[str]:
+        if not self.enabled:
+            return None
+        task_mode = self.infer_task_mode(goal, evaluation_type)
+        if task_mode == "answer":
+            return (
+                "[Task hint]\n"
+                "This is mainly an answer/query task. Prefer one short read-only command at a time. "
+                "Avoid long multi-line scripts. As soon as shell output contains the exact answer, call answer_action."
+            )
+        if task_mode == "hybrid":
+            return (
+                "[Task hint]\n"
+                "This task mixes implementation and answering. Make the minimal required change first, then verify it, "
+                "then return the final grounded value/path/output. Avoid oversized diagnostic scripts."
+            )
+        return (
+            "[Task hint]\n"
+            "This is mainly a state-change task. Prefer minimal changes and short verification commands. "
+            "Avoid large diagnostic scripts unless a short check already failed."
+        )
+
+    def should_block_complex_bash(self, state: TrajectoryState, command: str) -> Optional[str]:
+        if not self.enabled:
+            return None
+        task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
+        phase = self.replanner._infer_phase(state)
+        if not _is_large_multiline_script(command):
+            return None
+        if task_mode == "answer":
+            return (
+                "[Monitor] This bash script is too large for a query task. "
+                "Use one short read-only command next, and avoid multi-line scripts or set -euo pipefail."
+            )
+        if task_mode == "hybrid" and phase in {"diagnose", "answer"}:
+            return (
+                "[Monitor] The current step is too large. Narrow the task with one short command first. "
+                "Only use a larger implementation command after the target/output is clear."
+            )
+        if task_mode == "state" and phase == "diagnose":
+            return (
+                "[Monitor] The diagnostic script is too large. Use one short command to narrow the issue first, "
+                "then mutate or verify."
+            )
+        return None
 
     def build_memory_card(self, state: TrajectoryState) -> Optional[str]:
         if not self.enabled:
@@ -785,7 +979,12 @@ class OSMonitor:
             and not error_tags
             and (command_type in {"mutation", "mixed"} or _looks_like_setup_or_bootstrap(command))
         )
-        suspicious = bool(error_tags) or (command_type not in {"mutation", "mixed"} and not informative and not suppress_empty_signal)
+        suspicious = bool(error_tags) or (
+            command_type in {"inspection", "unknown"}
+            and not informative
+            and not suppress_empty_signal
+            and not _looks_like_pure_diagnostic_script(command)
+        )
 
         step = StepRecord(
             round_id=round_id,
@@ -803,7 +1002,8 @@ class OSMonitor:
         state.add_step(step)
         state.add_paths(_extract_paths(command, output))
 
-        if command_type in {"mutation", "mixed"}:
+        mutation_like = command_type in {"mutation", "mixed"} and not _looks_like_pure_diagnostic_script(command)
+        if mutation_like:
             state.last_mutation_round = round_id
             state.last_verification_round = None
         elif command_type in {"inspection", "unknown"} and informative:
@@ -837,7 +1037,7 @@ class OSMonitor:
         task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
 
         if action_name == "finish_action" and task_mode == "answer":
-            reason_codes.append("finish_on_match")
+            reason_codes.append("finish_on_answer_task")
 
         if not state.recent_steps:
             reason_codes.append("no_shell_evidence")
@@ -845,31 +1045,30 @@ class OSMonitor:
             latest_step = state.recent_steps[-1]
             if latest_step.error_tags:
                 reason_codes.append("latest_step_failed")
-            if (
-                latest_step.command_type not in {"mutation", "mixed"}
-                and not latest_step.informative
-                and not _looks_like_setup_or_bootstrap(latest_step.command)
-            ):
+            if latest_step.command_type in {"inspection", "unknown"} and not latest_step.informative:
                 reason_codes.append("latest_step_empty")
 
-        if action_name == "finish_action" and task_mode == "state":
+        if task_mode in {"state", "hybrid"} and action_name == "finish_action":
             if state.last_mutation_round is None:
                 reason_codes.append("finish_without_state_change")
             elif not state.has_verification_after_mutation():
                 reason_codes.append("missing_verification")
+            elif task_mode == "hybrid" and not state.has_productive_observation():
+                reason_codes.append("hybrid_answer_pending")
 
-        if action_name == "answer_action" and not state.has_productive_observation():
+        if task_mode == "answer" and not state.has_productive_observation():
             answer_text = (proposed_answer or "").strip()
             if answer_text != "0":
                 reason_codes.append("no_grounding_for_answer")
 
         reason_codes = self._dedupe(reason_codes)
-        if not reason_codes or not self._can_intervene(state, state.recent_steps[-1].round_id if state.recent_steps else 0):
+        current_round = state.recent_steps[-1].round_id if state.recent_steps else 0
+        if not reason_codes or not self._can_intervene(state, current_round):
             return None
 
         state.intervention_codes.extend(reason_codes)
         state.interventions.append(", ".join(reason_codes))
-        state.last_intervention_round = state.recent_steps[-1].round_id if state.recent_steps else 0
+        state.last_intervention_round = current_round
 
         summary = "; ".join(_REASON_TEXT[code] for code in reason_codes if code in _REASON_TEXT)
         tool_message = f"[Monitor] {action_name} blocked: {summary}."
@@ -898,8 +1097,6 @@ class OSMonitor:
         step: StepRecord,
     ) -> List[str]:
         reason_codes: List[str] = []
-        task_mode = self.replanner._infer_task_mode_from_goal(state.goal)
-
         previous_step = state.recent_steps[-2] if len(state.recent_steps) >= 2 else None
 
         similar_repeat_found = False
@@ -922,40 +1119,27 @@ class OSMonitor:
             reason_codes.append("loop")
             state.remember_blocked_command(step.command)
 
-        suppress_empty_signal = (
-            not step.informative
-            and not step.error_tags
-            and (
-                step.command_type in {"mutation", "mixed"}
-                or _looks_like_setup_or_bootstrap(step.command)
-            )
-        )
-
         if (
-            step.command_type in {"inspection", "mixed", "unknown"}
+            step.round_id >= 2
+            and step.command_type in {"inspection", "unknown"}
             and not step.informative
+            and not step.error_tags
+            and not _looks_like_setup_or_bootstrap(step.command)
+            and not _looks_like_pure_diagnostic_script(step.command)
             and _command_complexity(step.command) >= 2
-            and not suppress_empty_signal
         ):
             reason_codes.append("complex_empty")
 
         recent_window = state.recent_steps[-4:]
         suspicious_count = sum(1 for record in recent_window if record.suspicious)
-
-        if task_mode == "answer":
-            if len(recent_window) >= 3 and suspicious_count >= 3 and not state.has_productive_observation():
-                reason_codes.append("stall")
-            elif (
-                len(state.recent_steps) >= 2
-                and all(record.suspicious for record in state.recent_steps[-2:])
-                and not state.has_productive_observation()
-            ):
-                reason_codes.append("stall")
-        else:
-            if len(recent_window) >= 3 and suspicious_count >= 3:
-                reason_codes.append("stall")
-            elif len(state.recent_steps) >= 2 and all(record.suspicious for record in state.recent_steps[-2:]):
-                reason_codes.append("stall")
+        if len(recent_window) >= 4 and suspicious_count >= 4:
+            reason_codes.append("stall")
+        elif (
+            len(state.recent_steps) >= 4
+            and all(record.suspicious for record in state.recent_steps[-4:])
+            and not any(record.informative and not record.error_tags for record in state.recent_steps[-4:])
+        ):
+            reason_codes.append("stall")
 
         return self._dedupe(reason_codes)
 
@@ -992,3 +1176,4 @@ class OSMonitor:
                 deduped.append(item)
                 seen.add(item)
         return deduped
+
