@@ -2,6 +2,8 @@
 
 This folder packages the Extension 1 artifacts needed for review and reproducibility.
 It is prepared for readers such as course staff, teammates, and external reviewers who need a clear, self-contained reference for what was implemented and how to reproduce the reported behavior.
+Specifically, this extension adds a state-aware cycle detection mechanism during OS task execution to identify when the agent gets stuck repeating actions.  
+When a cycle is detected, the system triggers recovery and replanning to reduce wasted steps and improve end-to-end task completion stability.
 
 This bundle is intended to support:
 - fast technical review of the Extension 1 changes;
