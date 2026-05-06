@@ -1,11 +1,12 @@
-# Extension 1 Package README
+# Extension 1: Cycle Detection and Recovery Bundle
 
-This folder is a local bundle of Extension 1 related artifacts copied from the main project workspace.
+This folder packages the Extension 1 artifacts needed for review and reproducibility.
+It is prepared for readers such as course staff, teammates, and external reviewers who need a clear, self-contained reference for what was implemented and how to reproduce the reported behavior.
 
-It is intended for:
-- quick archiving of your current Extension 1 work;
-- easier handoff/reporting;
-- reproducibility with clear "what to run" and "what differs from baseline".
+This bundle is intended to support:
+- fast technical review of the Extension 1 changes;
+- straightforward handoff with minimal repository exploration;
+- reproducibility with explicit run commands and file mapping to the main project.
 
 ---
 
