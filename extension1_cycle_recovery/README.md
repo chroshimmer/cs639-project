@@ -1,12 +1,15 @@
 # Extension 1: Cycle Detection and Recovery Bundle
 
-This folder packages the Extension 1 artifacts needed for review and reproducibility.
-It is prepared for readers such as course staff, teammates, and external reviewers who need a clear, self-contained reference for what was implemented and how to reproduce the reported behavior.
+This folder packages Extension 1, a runtime cycle-detection and recovery mechanism for long-horizon OS tasks.
+The purpose of Extension 1 is to reduce loop/stall behavior (repeated commands, repeated observations, and low-progress trajectories) by injecting targeted recovery guidance at inference time.
 
-This bundle is intended to support:
-- fast technical review of the Extension 1 changes;
-- straightforward handoff with minimal repository exploration;
-- reproducibility with explicit run commands and file mapping to the main project.
+In the retained full runs of this bundle, Extension 1 shows a positive standalone gain over baseline (`0.3427 -> 0.3944`), while the coordinated combo setting reaches the highest score among the retained runs (`0.4857` under completed-only denominator).
+
+This bundle provides:
+- the Extension 1 code/config snapshots;
+- reproducible run scripts;
+- retained full-run outputs and metric summary;
+- file mapping for applying these changes onto the main project.
 
 ---
 
