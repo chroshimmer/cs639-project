@@ -1,0 +1,92 @@
+# One-A100 target config for final sepsis tool-calling RL.
+# This follows the verl GRPO/Agent Loop direction. verl's Agent Loop API is alpha;
+# verify field names against the installed verl version before launching a long run.
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+data:
+  train_files: data/rl_tool_call/verl_sepsis_core/train.parquet
+  val_files: data/rl_tool_call/verl_sepsis_core/val.parquet
+  prompt_key: prompt
+  return_raw_chat: true
+  train_batch_size: 4
+  val_batch_size: 4
+  max_prompt_length: 4096
+  max_response_length: 512
+  filter_overlong_prompts: false
+
+custom_reward_function:
+  path: src/sepsis_mvp/verl_reward.py
+  name: compute_score
+
+reward:
+  custom_reward_function:
+    path: src/sepsis_mvp/verl_reward.py
+    name: compute_score
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-4B-Instruct-2507
+    external_lib: src.sepsis_mvp.verl_agent_loop
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules: all-linear
+    override_config:
+      attn_implementation: sdpa
+  actor:
+    strategy: fsdp
+    optim:
+      lr: 5.0e-6
+    use_kl_loss: true
+    kl_loss_coef: 0.005
+    kl_loss_type: low_var_kl
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 1
+    ulysses_sequence_parallel_size: 1
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  ref:
+    strategy: fsdp
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+  rollout:
+    name: sglang
+    mode: async
+    temperature: 0.7
+    top_p: 0.95
+    n: 4
+    gpu_memory_utilization: 0.45
+    tensor_model_parallel_size: 1
+    response_length: 512
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      enable: true
+      max_assistant_turns: 4
+      max_user_turns: 4
+      tokenization_sanity_check_mode: ignore_strippable
+    agent:
+      num_workers: 1
+      default_agent_loop: sepsis_tool_agent_loop
+
+trainer:
+  project_name: rolling_healthcare_agent
+  experiment_name: sepsis_core_qwen4b_verl_grpo_a100
+  default_local_dir: checkpoints/sepsis_core_qwen4b_verl_grpo
+  total_epochs: 3
+  test_freq: 25
+  save_freq: 25
+  logger:
+    - console
+  n_gpus_per_node: 1
+  nnodes: 1
