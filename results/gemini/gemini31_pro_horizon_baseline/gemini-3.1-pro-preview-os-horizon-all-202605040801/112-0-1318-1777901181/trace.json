@@ -1,0 +1,557 @@
+[
+  {
+    "role": "system",
+    "content": "You are an assistant that will act like a person. I will play the role of a Linux (Ubuntu) operating system.\nYour goal is to implement the operations required by me or answer the questions proposed by me.\nFor each of your turns, you should first think about what you should do, and then call exactly one of the provided tools according to the situation.\nIf you think the output is too long, I will truncate it. The truncated output is not complete. You have to deal with the truncating problem by yourself.\nAttention, your bash code should not contain any input operation. Once again, you should use one tool in each turn, and should not respond without function calling.\nPrefer short, simple bash commands. Avoid large multi-line scripts unless the task explicitly asks you to create a script or file.\nFor query tasks, prefer one short read-only command; as soon as shell output contains the exact answer, call answer_action immediately.\nFor state-change tasks, prefer one minimal change and then one short verification command.\nNote that if you think the task has been finished, or there is some message missing to completely complete the task, you should respond with calling the function \"finish_action\", as no additional information will be provided.\nAlso, note that if you have gotten the answer to the question, you should call the \"answer_action\" tool instead of simply writing your answer in your response.\nYour answers should be exact and precise (for example, a single number), do not answer with full sentences or phrases.\nAlways use a tool provided instead of simply responding with content."
+  },
+  {
+    "role": "user",
+    "content": "Now, I will start a new problem in a new OS. My problem is:\n\n1. Create a temporary folder named '/working/temp_workspace' to hold intermediate artifacts and record that path for later steps.\n2. Recursively enumerate all entries under '/working' and save the raw listing to '/working/temp_workspace/raw_listing.txt'.\n3. From raw_listing.txt, filter the entries to include only regular files (exclude directories and special files) and save those paths to '/working/temp_workspace/regular_files.txt'.\n4. Normalize and deduplicate the regular file paths, then sort them and save the result to '/working/temp_workspace/normalized_files.txt'.\n5. Extract from normalized_files.txt any entries whose filename (basename) equals 'workspace' and write those full paths to '/working/temp_workspace/matches.txt'.\n6. Re-verify that each path in matches.txt still refers to a regular file and write a single flag file '/working/temp_workspace/present.flag' containing \"true\" if any verified matches exist, otherwise \"false\".\n7. Prepare a one-line staged result file '/working/temp_workspace/result_ready.txt' that will contain \"yes\" if present.flag is \"true\" or \"no\" if present.flag is \"false\", leaving the actual printing of that line for the final step.\n\nIf a regular file named \"workspace\" exists in /working (recursively)? If so, output \"yes\", otherwise output \"no\" (with out quotes)."
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-da9b8a20-3f25-4148-b5bf-b9bc618eda72",
+        "function": {
+          "arguments": "{\"script\":\"mkdir -p /working/temp_workspace\\nfind /working > /working/temp_workspace/raw_listing.txt\\nfind /working -type f > /working/temp_workspace/regular_files.txt\\nsort -u /working/temp_workspace/regular_files.txt > /working/temp_workspace/normalized_files.txt\\ngrep '/workspace$' /working/temp_workspace/normalized_files.txt > /working/temp_workspace/matches.txt || true\\n> /working/temp_workspace/verified_matches.txt\\nwhile read p; do\\n  if [ -f \\\"$p\\\" ]; then\\n    echo \\\"$p\\\" >> /working/temp_workspace/verified_matches.txt\\n  fi\\ndone < /working/temp_workspace/matches.txt\\n\\nif [ -s /working/temp_workspace/verified_matches.txt ]; then\\n  echo \\\"true\\\" > /working/temp_workspace/present.flag\\n  echo \\\"yes\\\" > /working/temp_workspace/result_ready.txt\\nelse\\n  echo \\\"false\\\" > /working/temp_workspace/present.flag\\n  echo \\\"no\\\" > /working/temp_workspace/result_ready.txt\\nfi\\ncat /working/temp_workspace/result_ready.txt\\n\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "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"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-da9b8a20-3f25-4148-b5bf-b9bc618eda72"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-ff847a49-502f-4451-89a2-d399f8225621",
+        "function": {
+          "arguments": "{\"script\":\"cat /working/temp_workspace/result_ready.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CssBAY89a1+MMYWyXEj1NYtjaemht3HjGo+uDUcFjy95xuqiA+3SUceCovILMLrSfTzmOMACQeJbyi4yLuLQVbczqBKipAjzTmQdXiZygUrWSiiPshsIrmG9Nh7cXD5AJ0HsNRYidpR7087bOGtdnd5GN1AsZaVyNSowgFSVIKBFUAZAeVN7Kf6eFX0HpsLP44+fbMwahJfzfQS8y82A0yJnqS8LT5hgZ0qBWFyrLitkt2beziq5QL1am2WZIvnASIpx3BMz3CR/MyoVwH4="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-ff847a49-502f-4451-89a2-d399f8225621"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-426fbbc5-8e94-465b-b7c0-8ee0e1aee03a",
+        "function": {
+          "arguments": "{\"script\":\"ls -la /working/temp_workspace\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CmwBjz1rX0XVnlUQytyzIV1G6fJkdy1IzLjSvm+e8RhcdY2O5yHOVi/POhGTmCGCcyQ6tGEUKUCm93XcCt54vU84Nfv9csVjtryeDeVORW6GiuSIdLL2mnsOOlgwBf2taTu6GsbhrhfgDvmJLYQ="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-426fbbc5-8e94-465b-b7c0-8ee0e1aee03a"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-5208d809-7dc8-4b0c-b059-37ae4376af05",
+        "function": {
+          "arguments": "{\"script\":\"ls -l /working\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CmMBjz1rX6xumrink3EJlg4+5I4GNKgjd8KKyMsAGslJAWQ3o4grwgy0aa4wuA7tZPcCUSByfj9QfmQ96C1Q/e1xzaeBLAIf444u78IWBDMGVDKOTqdq/+h/y/QEjvAZFDd6JC4="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-5208d809-7dc8-4b0c-b059-37ae4376af05"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-71db4470-89c6-4631-8330-7da52e0da8af",
+        "function": {
+          "arguments": "{\"script\":\"ls -l /\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "Ck0Bjz1rXw65/fbwxCSNfhuQWzdTMTKK+biWStiPtUvNG9FVjwp20+JM51xagBn8Z8DmtJlYGmHl9oDFM5Ya+sNl0ZTKplcrJI7OIyiVlg=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-71db4470-89c6-4631-8330-7da52e0da8af"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-71abfa87-f31f-43cc-98bf-4d8d819b5919",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"hello\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CnEBjz1rXyS34WayyZyuw7qHyO1cvo+4/jbITMVcb9T/DWi4xYA5B15By+foQl9Ps1lGPTB5kHniqwz/D7QQr2MhUyOiGUxLLHMDeFt/FK5jGdPCMmk8PArDsbf2kqsID+IkiWKcRPpDFvdE3FXnz/blVg=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-71abfa87-f31f-43cc-98bf-4d8d819b5919"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-e0d01b43-92a8-4467-aaa2-01450eb57a5a",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"hello\\\" >&2\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CsMDAY89a18+61qhrdin0dMY1wBEjPYuoecEA6o91acN+y90KpKLiGd1yXP2CCWNaCciGjqjoB76L4S1C4kYMYPl8b+UX0o2gMHmYQjGBZMhK5p5pPDvFG1OSuTwxAW5P6HlJF2HopndfVw9D8TcGzbZ8G67/hgtWjM1z+Y/u87T8HrGUxlj+IyDRhTUFAsEo9zLXz7sM+dD37N0GfBwrdXL2ZdvNJxJaKTcxY+Yv59q4AD9Psqwugit5dPJ5CHZgVDN4ejjmjL1y9AInhLwrviIzi1C2Ji85w/j/qvEUn0gTXgYto1z5vSMfViyR9+oRNiVKrpN8hN29hcOs+tnuFmmybXE2eV57WZFeSl8T+8DJIsZx61ZO2a2WXcKvltM4Eong1Zjtfz+a6reBiHYwqlz3TjP8FVz38k5WLVNF+44rNT6awU3+qUwPbL+HcSJ/hrfnDU+Rh/1k1Sexu2HS7AGr/kuMZl27m0ZopxPWkqNQ7KlDVJjpDr+tbDyEuUuwvE9cwMVLTL0RCjoMHJSPdHJe0iRzEDe77JjTLVaczYAoT83hc7Gg+dCJkDdN2gadZBdmDLzfm9K6aZY5OeaX5iksuA1nw=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\n  if [ -f \"$p\" ]; then\r\n\r>     echo \"$p\" >> /working/temp_workspace/verified_matches.txt\r\n\r>   fi\r\n\r> done < /working/temp_workspace/matches.txt\r\n\r\n",
+    "tool_call_id": "function-call-e0d01b43-92a8-4467-aaa2-01450eb57a5a"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-7803717c-071d-4213-9eb1-693b4f2d503c",
+        "function": {
+          "arguments": "{\"script\":\"killall bash || true\\necho \\\"hello\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "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"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\n>   echo \"true\" > /working/temp_workspace/present.flag\r\n\r>   echo \"yes\" > /working/temp_workspace/result_ready.txt\r\n\r> else\r\n\r>   echo \"false\" > /working/temp_workspace/present.flag\r\n\r>   echo \"no\" > /working/temp_workspace/result_ready.txt\r\n\r> fi\r\n",
+    "tool_call_id": "function-call-7803717c-071d-4213-9eb1-693b4f2d503c"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-29900745-a08b-46de-b4c1-5bbcfed6c0f6",
+        "function": {
+          "arguments": "{\"script\":\"\\\"\\n'\\ndone\\nfi\\n\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CrsBAY89a1845FF2WNM58ZhKmj6OV1nIqrWfBmKRpUcwBDmA1AxfPMeBc5YkncG1h0jjB8ODz8DHk0EqF+K1qDSfD23tZ+5G+Tr2pTJOFPMaD62gU66drG6oqV4RU7XqZk7CBIMXyBPM6xzmvzMJW3O2E5L6pppaOYYRzCFtGvElOind20ihIHIlG5cMO6AKbd6O+zmXZ6mDEsVL8RZuQfGY3/yBV8jzI/cRWMT7ZAHnTpJS8opQgcPVd2ByqQ=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nyes\r\n\r\n\r",
+    "tool_call_id": "function-call-29900745-a08b-46de-b4c1-5bbcfed6c0f6"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-d58a2a86-b772-45dc-b258-e52e8f50512c",
+        "function": {
+          "arguments": "{\"script\":\"cat /working/temp_workspace/result_ready.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "Ct8BAY89a1/BFcxhCTgZpsj4hjCyyO3asehmXM9/dJ9pfAYYCfBqJRwmTJjKheSwfdFo5vkDxyQIghxBubMpjoW5vTrjJQgWjc4wwHuwA4a11xH93BbIYxdAlIuy9w6TtRLuykeP09pOS9xycfM/Rw7zZBnA2pdQD4BkS6IJRqDSZeV/jJ0JizPDUOn5ueE371C2VTFp7YH+eWYPUMC+LtER+03myiYkBRtFj6tBcU4BlOD2oX1pik7ooT1OvXnS/mzNvZAhD+KFi3CdtGMu9sk9e/LbwXy1AsPg5JUrtZ4hnQ=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-d58a2a86-b772-45dc-b258-e52e8f50512c"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-0632deda-2791-4f8e-bd34-796781830b5b",
+        "function": {
+          "arguments": "{\"script\":\"ls -l /working/temp_workspace\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CmYBjz1rX8UDTumdn1oAbEQKkdM6JXsFJB7fdKUfwmrKR6A+Jl+8pNbVjQF8S6IHmKR5aL7dZvW/fJ3tXRae6dRopYD4W4936wyGonv6XUQPa7Pi07aKy5h1vy4vG7/fs8vITNfDwJY="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nyes\r\n",
+    "tool_call_id": "function-call-0632deda-2791-4f8e-bd34-796781830b5b"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-86e20d01-d7ac-474d-b44b-7721eae95ceb",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"test\\\" > /tmp/test.txt && cat /tmp/test.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CrIBAY89a18hRe9qK4c7x1jWggYRF5LQ/m5e6SyAjUMzJFnyizOX3UwZ2IBDmtJFjqN5slN4Qz0KELg3et/5756lEBcIkS6cvIkSyp6OhvEqnpJ2j7WpqDB6xy31ACJuAxGvjHqbA7xu7XLze8v4Ha7VrDUWN34k/H4tusZ6XgodO9VGD+ADNCvXtlK+VkaLPmMtjlg50EBEI4urpr5sCgpSAnHkcPbo2JJBQPC1UPAJbawUwgoiAY89a1/mnXcum+UtkXhkv2XgFTPIzBRERvRBDP3xsgjhhw=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\ntotal 36\r\ndrwxrwxrwx+ 2 root root 4096 May  4 13:22 .\r\ndrwxrwxrwx+ 4 root root 4096 May  4 13:22 ..\r\n-rw-rw-rw-+ 1 root root   22 May  4 13:22 matches.txt\r\n-rw-rw-rw-+ 1 root root  165 May  4 13:22 normalized_files.txt\r\n-rw-rw-rw-+ 1 root root    5 May  4 13:22 present.flag\r\n-rw-rw-rw-+ 1 root root  168 May  4 13:22 raw_listing.txt\r\n-rw-rw-rw-+ 1 root root  165 May  4 13:22 regular_files.txt\r\n-rw-rw-rw-+ 1 root root    4 May  4 13:22 result_ready.txt\r\n-rw-rw-rw-+ 1 root root   22 May  4 13:22 verified_matches.txt\r\n",
+    "tool_call_id": "function-call-86e20d01-d7ac-474d-b44b-7721eae95ceb"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-8bcd8747-6015-4e1d-b76c-f5832c42d5fd",
+        "function": {
+          "arguments": "{\"script\":\"cat /working/temp_workspace/result_ready.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CscBAY89a19YQSWf3zYMaU8aeWzrSFiJnIWLZ4C9V03uFQNYiyOZinmHERWg08b8HoWCL7sB+7t7Z/WOf00spzaYvyKe3Zr9DYd6yiBTguGokdcgpCWBks33nyDZEaNTWhaaW71ml5HHry9WlqBUqW7Y+9JogLrnPbOyFMzdIrY9QyTQfoV33lan5RFys1z7JCBmVpLs4QdK5qzuCXfwqPjPJcfPaKQJ8GRC0lCcQTiYAvhBNgZoAjWCB6AzDRsv4wN8dwgKP/nAHA=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\ntotal 8\r\ndrwxrwxrwx+ 2 root root 4096 May  4 13:22 OS\r\ndrwxrwxrwx+ 2 root root 4096 May  4 13:22 temp_workspace\r\n",
+    "tool_call_id": "function-call-8bcd8747-6015-4e1d-b76c-f5832c42d5fd"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-a62193a2-5e37-4f60-8bac-dbc4069bb488",
+        "function": {
+          "arguments": "{\"script\":\"cat /working/temp_workspace/result_ready.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "Co0BAY89a19X2SujcQhdWoojsDi94RIM7sWCv+9ZLcR/0IoiZpa/1gwP2+iLhCE7uwH/sq4cnajcWObjcdJhV/Dac5kxEt7yYqTghhZdcPJ2kaIW4SQ79//bUIPV25ulmpTXPLp6kiiS5WWPZLKStCJqMPO7CfDjGv355iEWRDXvyOy+AcIaseUXJDHh3ucD"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\ntotal 52\r\nlrwxrwxrwx    1 root   root       7 Jan  2 12:35 bin -> usr/bin\r\ndrwxr-xr-x+   2 root   root    4096 Jan  2 12:35 boot\r\ndrwxr-xr-x    5 root   root     340 May  4 13:22 dev\r\ndrwxr-xr-x+  33 root   root    4096 May  4 13:22 etc\r\ndrwxr-xr-x+   2 root   root    4096 Jan  2 12:35 home\r\nlrwxrwxrwx    1 root   root       7 Jan  2 12:35 lib -> usr/lib\r\nlrwxrwxrwx    1 root   root       9 Jan  2 12:35 lib64 -> usr/lib64\r\ndrwxr-xr-x+   2 root   root    4096 Feb 23 00:00 media\r\ndrwxr-xr-x+   2 root   root    4096 Feb 23 00:00 mnt\r\ndrwxr-xr-x+   2 root   root    4096 Feb 23 00:00 opt\r\ndr-xr-xr-x  792 nobody nogroup    0 May  4 13:22 proc\r\ndrwx------+   2 root   root    4096 Feb 24 19:43 root\r\ndrwxr-xr-x+   3 root   root    4096 Feb 23 00:00 run\r\nlrwxrwxrwx    1 root   ro\n[truncated because the output is too long]",
+    "tool_call_id": "function-call-a62193a2-5e37-4f60-8bac-dbc4069bb488"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-4c2a1438-0df4-4a35-a10f-c8a7ecdea6c8",
+        "function": {
+          "arguments": "{\"script\":\"cat /working/temp_workspace/result_ready.txt\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CsEBAY89a1/GnlDsJPlB+Xh+7uZEY7oftLmB2ovoe6ciCXkq7K5vn1yId+NEMLuwIg9uawTlChmvJcSotdFRp1X5ytwNIyeULYAMyBNjkPekW78lkUDDOzISh79ojYjpPeG6JXtqOsuunfluNbunUp96I811Qww8Kmst0Xo7vwTMeQJDe0YFa+tHAqjEYtEg/cd0KYCbMeLsf3FfudpwN/ebj+BHXQzpaYmBRooB8q594shuagmpbP3zgP0D7hspu3UHvQ=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-4c2a1438-0df4-4a35-a10f-c8a7ecdea6c8"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-c5359c80-01b8-42f7-85a3-f0c3eeeb401b",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"SYNC\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CoABAY89a1+XOnBEXNrhpAvBroHESi9DZtIBFHA94PM7MA4MmMpun2x17BNtgiBh8oyjiyBtIwaDmDJQArY25fcthZLVxA6mSRcdvvGkNsHvuo4vzkIXY8SQaEWBvoCx3sms0wNRU4HZ2MCuZc4bFmTs5YwCYtCZhda/M3NZRg01Lxc="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-c5359c80-01b8-42f7-85a3-f0c3eeeb401b"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-843ed76b-c8b2-454a-8f21-d0a85a7fc3f2",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"SYNC\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CjUBjz1rX7ozeNuye3+YwdKypDjvwNiMc08TDWQjuA5pFeU3TLXWs1zrDCCeF6BkFZxiYuOSdgoiAY89a1+UBmlJ50Ldo8gbwYt7bdFeMAolkc90VidvCEGnIg=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-843ed76b-c8b2-454a-8f21-d0a85a7fc3f2"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-a7774a96-f1f1-48c8-9ae4-cc86df59bea3",
+        "function": {
+          "arguments": "{\"script\":\"find /working -type f -name \\\"workspace\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CrMBAY89a1/N64mk3NIJWFsIkw3Vm2nl/MoaQdGNUBxJ5xzgnE/q4aN5sBrdV4VxO68CSc9VtuoHwVTeG+evQbfWMdfPPOQNZzc/rjhv1lvmFt8+5jZPcbhl2UTCsePl7bttKO/ZYyK/dEWO51s4dk6raV8q1mYfzdDmzc8TmxtAwBXV7LzUWVuXdxf3GYrCKVFnbQTPlqiPcbPDhMyZ+L5sQHUT6Yq9o/XqZ9la+guk6ddOBycKIgGPPWtfDchJTX/tulbMQUZqCX0XQUBLHvw57D2Z0YcAc48="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS is empty.",
+    "tool_call_id": "function-call-a7774a96-f1f1-48c8-9ae4-cc86df59bea3"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-7f40e622-891c-4ee8-9be0-4de0d876e0b2",
+        "function": {
+          "arguments": "{\"script\":\"find /working -type f -name \\\"workspace\\\" | wc -l\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CkcBjz1rX2mT9aSemNR7xdGpAkHzckCixb4K3qkL+Fk3y7IQGPnbEG918FI7m/fpvUDx1S2k50LGFBLbxEaAiyRO3awRtR8K+Q=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nOS execution failed: ",
+    "tool_call_id": "function-call-7f40e622-891c-4ee8-9be0-4de0d876e0b2"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-37f3eacc-7473-4339-8ad6-325840aa3801",
+        "function": {
+          "arguments": "{\"script\":\"echo \\\"SYNC\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "ClgBjz1rXwll2e9Ig4e+Udvc78BpyRZ2ZD4RBIxlZZCVOUIsfB0owX3Qc39AwYwSLYp7/5H9J1KnHe++Wgt7u2M1ECurlu5P2ovwheZs4hW723mVsYHEw8fe"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nOS execution failed: ",
+    "tool_call_id": "function-call-37f3eacc-7473-4339-8ad6-325840aa3801"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-5e2d7a8a-3637-4a71-97b5-f39169786807",
+        "function": {
+          "arguments": "{\"script\":\"date\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "ClwBjz1rXySRz1jjLTvQXDHrdu9tuTGv9Bnby3daqMiLWV3J4F980UXal3WsRwsi1K7l0FTbp/F9XppSVbwSdv091HTDGWPmWTKamEr28kHOA579Zc+w4PV6TN7wfA=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nOS execution failed: ",
+    "tool_call_id": "function-call-5e2d7a8a-3637-4a71-97b5-f39169786807"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-2ba0b073-feca-4a4d-ba4b-6fb92da93c74",
+        "function": {
+          "arguments": "{\"script\":\"ls /\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CrICAY89a1/CdrPaw3w8xJBAzCrFx5xPiPBCvswrl4BivrLx9rAxDo4KyxGdFG4I3Tlk9pnR+QrwvsluCRny52StMbRoNHXLC4t2YXwWXkxvId6KyqtYB5crYc3aPTgoEUehxSpHgg6YXqQb5e6wqAZDI9Vk6iMY3rj0w3rqBVBlcpK8/TQ3L9DZ/Ylqt9TCeY/t+L4faFsJzNHXFNDB3/7nwtaaGGcPdabd5OLKIlxOpXh+tu8uMG/UTNKGZA0vMZ07+9dwrXfh42G/dt/EVl8xHZfXHpagbmM+74W2+kKxW6A1fEZlv8kgu5THMXp+WgMIjmk5rYo/+8Zxg3q1Wb4RiCApDC2LbvE5mW1JRLBZHnF25Fvy4m7l2vkfmpBVaAibIkYWd6Rb8KT33FKcKFMoJry9"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nOS execution failed: ",
+    "tool_call_id": "function-call-2ba0b073-feca-4a4d-ba4b-6fb92da93c74"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-aee81652-e5d1-4cc3-9683-99e71326e77d",
+        "function": {
+          "arguments": "{\"script\":\"sh -c \\\"ls\\\"\"}",
+          "name": "bash_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "CqcCAY89a1/pyokDeKVBf2kmd75cP6VT9lM5W73NuON8iQOFzVofISoJo91vg6kZ+1Kb1HNVHfWAqWq3V+M+O/Hg5nS78LiT342DDEAE1felhWbpXTkxhD4rP4AFp8k2B78Ebs1+776wXQ8gB+jgdzUTANqnQjdBJniZJ0GYyanX9MEN2Tt35V+2hMmBJhEZtoNpH31DLuVU2oUX+DvW+fXKte0OFAvwN8X+H1u9CkLXSzsKcKIW8WvOFWsj2zHGVYdIZsCIldtJu4xoFURRj5zkh2I8PPtVCFAQKQ97ZyuguufKQsayO3u7kfoIg7D/j/ChDhTilSo4w8TnXMRfXKTg289GfveS9kkyXaMRJJBRsiOUqRIV8BIV8jOQIG2+AVqn3O/Uekb5fg=="
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "The output of the OS:\n\nOS execution failed: ",
+    "tool_call_id": "function-call-aee81652-e5d1-4cc3-9683-99e71326e77d"
+  },
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "function-call-4cca9751-5db9-42fe-860d-4b12c075dd0a",
+        "function": {
+          "arguments": "{\"answer\":\"yes\"}",
+          "name": "answer_action"
+        },
+        "type": "function",
+        "extra_content": {
+          "google": {
+            "thought_signature": "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"
+          }
+        }
+      }
+    ]
+  }
+]
