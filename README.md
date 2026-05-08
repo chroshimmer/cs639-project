@@ -1,54 +1,177 @@
-# CS639 Project: Long-Horizon OS Tasks
+# Diagnosing and Improving Long-Horizon OS Agents
 
-This repo/project is based on **THUDM/AgentBench (AgentBench FC / function-calling version)**.  
-This course project focuses on **OS interaction tasks**, specifically Long-Horizon OS tasks.
+This repository is a CS639 course project built on the function-calling version of [THUDM/AgentBench](https://github.com/THUDM/AgentBench).  We focus on **OS interaction tasks** and study whether a lightweight inference-time monitor can improve LLM agents on both standard OS tasks and long-horizon OS tasks.
 
-> Note: This setup was made to run on **UW–Madison CSL machines** (rootless Docker, no sudo).  
-> Some changes below may be **CSL-specific** and not necessary on a normal local Linux + rootful Docker setup.
+The main system in this repo is **monitor-replan**: a rule-based, trace-aware prompting pipeline that sits on top of the same acting model.  It does **not** train a new model.  Instead, it watches the task trajectory, detects failure risks, and injects targeted supervision only when needed.
 
----
-
-## 1) What changed (CSL-specific)
-
-Some edits were made to make AgentBench FC (OS) runnable on CSL machines:
-
-- **Edited Dockerfiles for OS env images**
-  - `data/os_interaction/res/dockerfiles/default`
-  - `data/os_interaction/res/dockerfiles/packages`  
-  (Goal: avoid Ubuntu base image install / permission issues under rootless Docker; use a more stable base + non-interactive installs.)
-
-- **Edited OS task config (Redis host)**
-  - `configs/tasks/os.yaml`  
-  Changed Redis host from a hard-coded IP (e.g., `172.17.0.1`) to the compose service name **`redis`** for container-to-container networking.
-
-- **Edited OS task worker image Dockerfile**
-  - `src/server/tasks/os_interaction/Dockerfile`  
-  (Goal: make the OS task worker container compatible with CSL rootless Docker constraints.)
-
-- **Added an OS-only docker compose file**
-  - `extra/docker-compose.os-only.yml`  
-  (Goal: start only what we need for OS tasks: controller + redis + `os_interaction-std` worker.)
-
-- **Added a lightweight monitor + replanner path for OS tasks**
-  - `src/server/tasks/os_interaction/monitoring.py`
-  - `src/server/tasks/os_interaction/task.py`
-  - `configs/tasks/os.yaml`  
-  (Goal: keep the original `os-std` baseline intact, while adding `os-std-monitor-replan` with state memory, loop/stall detection, commit gating, and recovery prompts.)
-
-These edits are intended for CSL machines; on other systems you may not need them.
+This README documents the main monitor-replan project only.  It does not cover the separate project extensions.
 
 ---
 
-## 2) Quick Start (on a  CSL machine)
+## Project summary
 
-### Step 0 — Clone
+### Problem
+
+LLM agents can solve some short OS tasks, but their success rate often drops as interaction horizons grow.  Longer trajectories make it harder to preserve the task goal, maintain state, verify changes, and avoid loops or premature termination.
+
+### Goal
+
+We evaluate whether an inference-time monitor can help OS agents:
+
+- stay grounded in shell evidence,
+- avoid planning drift,
+- recover from repeated or weak-signal actions,
+- verify state changes before finishing,
+- and remain robust as tasks become more long-horizon.
+
+### Main result
+
+Across the models we tested, the monitor improves performance on both the original AgentBench OS benchmark and a reconstructed HORIZON-style safe subset.
+
+| Benchmark | Models tested | Baseline -> w/ Monitor | Gain range |
+|---|---:|---:|---:|
+| Original AgentBench OS | 5 models | standard 144-task benchmark | +1.4 to +21.6 pts |
+| HORIZON-style safe subset | 3 models | 146-task long-horizon subset | +15.8 to +35.6 pts |
+
+The largest gains occur on weaker or mid-tier base models and on long-horizon tasks, suggesting that monitor-replan is most useful when the base agent is likely to lose task focus or skip verification.
+
+---
+
+## Benchmarks
+
+### 1. Original AgentBench OS
+
+The standard benchmark is the public AgentBench FC OS task set used by the project baseline.
+
+- Task name: `os-std`
+- Monitored task name: `os-std-monitor-replan`
+- Size: 144 OS tasks
+- Metric: success rate reported by `agentrl-eval`
+- Environment: containerized OS interaction environment
+
+### 2. HORIZON-style safe subset
+
+We also evaluate on a conservative long-horizon subset reconstructed from the public HORIZON OS release.
+
+The public HORIZON parquet contains prompts / trajectories, but it does not directly provide runnable AgentBench-style OS initialization and evaluation configs.  To keep automatic evaluation valid, we only keep augmented prompts whose final objective remains compatible with their own AgentBench base task.
+
+- Task name: `os-horizon-all`
+- Monitored task name: `os-horizon-all-monitor-replan`
+- Size: 146 tasks
+  - `cf0`: 46 base tasks
+  - `cf1`-`cf10`: 10 compatible augmented tasks per tier
+- Important caveat: this is a **HORIZON-style safe subset**, not the official HORIZON OS evaluator.  The original AgentBench final evaluator is reused, so final-task compatibility is checked, but the added HORIZON intermediate constraints are not fully oracle-checked.
+
+Per-tier task names are also available:
+
+```text
+os-horizon-cf0 ... os-horizon-cf10
+os-horizon-cf0-monitor-replan ... os-horizon-cf10-monitor-replan
+```
+
+`cf0` is the unaugmented HORIZON base subset derived from AgentBench.  `cf1` is the first augmented long-horizon level, and `cf10` is the longest level used here.
+
+---
+
+## Method: monitor-replan
+
+The monitor is an inference-time control layer over the same base model.  The base model still acts through AgentBench's normal tools, but the monitor maintains a compact trajectory state and decides whether to inject extra guidance.
+
+### High-level pipeline
+
+```text
+Task + history
+    -> mode inference
+    -> trace monitor
+    -> typed intervention
+    -> next model action
+```
+
+The monitor uses deterministic heuristics, not a learned classifier or a second LLM.
+
+### 1. Task + trajectory state
+
+For each task, the monitor keeps a compact background state containing:
+
+- the original task goal,
+- evaluation type,
+- recent shell commands and observations,
+- command type: inspection / mutation / mixed / unknown,
+- error tags and weak-signal indicators,
+- known target paths,
+- blocked commands,
+- intervention history,
+- last mutation round,
+- last verification round.
+
+This state is not directly shown to the model at every turn.  When the monitor decides intervention is needed, part of this state is summarized into a short working plan or recovery prompt.
+
+### 2. Mode inference
+
+The monitor first classifies the task into one of three modes:
+
+| Mode | Typical task | Desired behavior |
+|---|---|---|
+| `answer` | count, path, yes/no, output, file content | use short read-only commands, then call `answer_action` |
+| `state` | chmod, rename, modify, create, delete, install | mutate minimally, verify, then finish |
+| `hybrid` | implement or modify something, then report a result | implement -> verify -> answer |
+
+This is a rule-based keyword heuristic.  For example, phrases like `how many`, `count`, `what is`, `full path`, and `yes or no` suggest answer-mode tasks.  Phrases like `chmod`, `rename`, `make writable`, `delete`, `modify`, or `install` suggest state-change tasks.  If both kinds of signals appear, the task is treated as hybrid.
+
+### 3. Trace monitoring
+
+After each model action, the monitor checks whether the trajectory is likely to be going wrong.  It detects patterns such as:
+
+- repeated commands or repeated observations,
+- broad search that does not reduce uncertainty,
+- large multi-line bash scripts issued too early,
+- weak or empty shell evidence,
+- environment mutation during a pure answer task,
+- mutation without follow-up verification,
+- answer or finish attempts without sufficient grounding,
+- tool-call protocol problems.
+
+### 4. Typed intervention
+
+When risk is detected, the monitor injects targeted supervision.  The intervention depends on the failure type.
+
+| Failure pattern | Intervention |
+|---|---|
+| Answer/query drift | read-only hint, direct evidence gathering, use `answer_action` |
+| State mutation without verification | require explicit verification before finish |
+| Hybrid task confusion | enforce implement -> verify -> answer sequencing |
+| Loop or stall | stop repeating command; choose a new direct check |
+| Oversized script | block brittle multi-line bash; request one short command first |
+| Weak grounding | gather direct evidence before answering |
+| Unsafe finish / answer | commit gate blocks termination |
+
+The monitor is intentionally selective.  It does not inject a plan every turn; it intervenes only when the trajectory shows clear risk.
+
+---
+
+## Key files
+
+| File | Purpose |
+|---|---|
+| `src/server/tasks/os_interaction/monitoring.py` | monitor state, task typing, trace analysis, recovery prompts, commit gate, oversized-script guard |
+| `src/server/tasks/os_interaction/task.py` | OS task worker, task loading, initial hint injection, tool handling, trace recording, integration with monitor |
+| `configs/tasks/os.yaml` | task entries for baseline, monitor, HORIZON safe subset, and per-tier HORIZON runs |
+| `extra/docker-compose.os-only.yml` | controller + redis + OS workers for the standard and HORIZON tasks |
+| `data/os_interaction/data_horizon/` | reconstructed HORIZON-style safe subset data |
+| `results/` | run logs, `results.jsonl`, and per-task traces |
+
+---
+
+## Setup
+
+These instructions are written for the UW-Madison CSL environment, where rootless Docker is used and sudo is not available.  On a normal Linux machine with rootful Docker, some CSL-specific steps may not be necessary.
+
+### 1. Clone and install Python dependencies
+
 ```bash
 git clone https://github.com/chroshimmer/cs639-project.git
 cd cs639-project
-```
 
-### Step 1 — Python env + install deps
-```bash
 conda create -n cs639-project python=3.11 -y
 conda activate cs639-project
 
@@ -56,277 +179,70 @@ pip install -r requirements.txt
 pip install -U agentrl-eval openai anthropic
 ```
 
-### Step 2 — Start rootless Docker (CSL)
+### 2. Start Docker on CSL
+
 ```bash
 systemctl --user start docker.service
 ```
 
-### Step 3 — Build OS env images (local-os/*)
+### 3. Build local OS environment images
+
 ```bash
 docker build -t local-os/default  -f ./data/os_interaction/res/dockerfiles/default  data/os_interaction/res/dockerfiles
 docker build -t local-os/packages -f ./data/os_interaction/res/dockerfiles/packages data/os_interaction/res/dockerfiles
 docker build -t local-os/ubuntu   -f ./data/os_interaction/res/dockerfiles/ubuntu   data/os_interaction/res/dockerfiles
 ```
 
-### Step 4 — Start OS-only stack (controller + redis + os worker)
+### 4. Start the OS-only stack
+
 ```bash
 docker compose -f extra/docker-compose.os-only.yml up --build -d
 ```
 
-Sanity check (controller reachable):
+Sanity check:
+
 ```bash
 curl -s http://localhost:5020/api/get_tasks | head
 ```
 
-Sanity check (start_sample returns non-empty `messages`):
+Check that the worker can start a sample and returns non-empty `messages`:
+
 ```bash
 curl -s -H 'Content-Type: application/json' \
   -d '{"name":"os-std","index":0,"custom_task":null}' \
   http://localhost:5020/api/start_sample | head -c 300; echo
 ```
 
-Optional sanity check for the monitored variant:
+Check the HORIZON worker:
+
 ```bash
-curl -s -H 'Content-Type: application/json' \
-  -d '{"name":"os-std-monitor-replan","index":0,"custom_task":null}' \
-  http://localhost:5020/api/start_sample | head -c 300; echo
+curl -s "http://localhost:5020/api/get_indices?name=os-horizon-all" | head -c 300; echo
 ```
 
-### Step 5 — Run evaluation
+If `start_sample` returns an empty `messages` array, verify that `configs/tasks/os.yaml` places the Redis settings under `env_options`, for example:
 
-Set API key (AgentRL evaluator uses this variable reliably):
+```yaml
+env_options:
+  network_name: agentbench-fc_default
+  state_driver: redis
+  state_options:
+    connection:
+      host: redis
+```
+
+---
+
+## Running evaluations
+
+Set the API key expected by `agentrl-eval`:
+
 ```bash
 export OPENAI_API_KEY="YOUR_OPENAI_KEY"
 ```
 
-Small test:
-```bash
-agentrl-eval \
-  --no-interactive \
-  -c http://localhost:5020/api \
-  -u https://api.openai.com/v1 \
-  -m gpt-5.1 \
-  --indices-range "0-4" \
-  --concurrency 1 \
-  -n 1 \
-  -o results \
-  os-std
-```
+### Original AgentBench OS
 
-Monitor + replanner variant:
-```bash
-agentrl-eval \
-  --no-interactive \
-  -c http://localhost:5020/api \
-  -u https://api.openai.com/v1 \
-  -m gpt-5.1 \
-  --concurrency 4 \
-  -n 1 \
-  -o results \
-  os-std-monitor-replan
-```
-
-Full run (144 indices):
-```bash
-agentrl-eval \
-  --no-interactive \
-  -c http://localhost:5020/api \
-  -u https://api.openai.com/v1 \
-  -m gpt-5.1 \
-  --concurrency 4 \
-  -n 1 \
-  -o results \
-  os-std
-```
-
-Outputs go to:
-- `results/<model>-os-std-YYYYMMDDHHMM/`
-  - `run.log`
-  - `results.jsonl`
-  - per-index traces (e.g., `*/trace.json`)
-
-The `os-std-monitor-replan` traces additionally contain injected `[STATE MEMORY]` and `[Monitor]` messages, which makes later trajectory analysis easier.
-
----
-
-## 3) Current results (preliminary)
-
-All runs are stored under the `results/` directory in this repo.
-
-Initial reproduction (CSL machines):
-
-- **gpt-5.1**: SR ≈ **38.8%**
-- **gpt-5-mini**: SR ≈ **28.7%**
-
-(“SR” here refers to the success rate metric reported by `agentrl-eval` at the end of `run.log`.)
-
----
-
-## 4) Progress update: monitor-assisted long-horizon improvements
-
-This section documents the **post-baseline monitor-assisted improvements** that were added after the initial CSL reproduction.
-
-### Motivation
-
-The original `os-std` baseline keeps the agent loop simple, but long-horizon failures often come from:
-
-- **task-type confusion**  
-  query-style tasks (for example, *how many*, *which path*, *what is the output*) being treated like state-change tasks
-
-- **over-long bash steps**  
-  the model sometimes emits a large multi-line script too early, which is expensive, brittle, and often yields weak evidence
-
-- **loop / stall behavior**  
-  repeated commands, repeated observations, or broad exploration without reducing uncertainty
-
-- **premature finish / answer**  
-  the model may try to finish without verification, or answer without grounded shell evidence
-
-- **tool-calling protocol mistakes**  
-  some model responses produce multiple tool calls or awkward plain-text answers when a tool call is required
-
-### What we added
-
-The monitored variant (`os-std-monitor-replan`) now includes the following components.
-
-#### A. Goal-aware task typing
-
-We added a lightweight goal heuristic in `src/server/tasks/os_interaction/monitoring.py` that classifies each task into one of three modes:
-
-- **answer**
-- **state**
-- **hybrid**
-
-This is important because many OS tasks are not pure state-change tasks. Some only require a grounded answer, while others require a small implementation step **followed by** a grounded answer.
-
-Examples:
-
-- **answer**: “how many …”, “tell me …”, “full path …”, “what will be the output …”
-- **state**: “change permission …”, “rename …”, “make file writable …”
-- **hybrid**: “write a bash script … then calculate / output / report …”
-
-This task typing is used by the monitor to decide:
-- whether mutation is appropriate at all,
-- whether the next phase should be diagnose / mutate / verify / answer,
-- how aggressive the monitor should be.
-
-#### B. Initial task hint
-
-At the beginning of each sample, the worker injects a short **task hint** that tells the model whether the task is mainly:
-- query/answer,
-- state-change, or
-- hybrid.
-
-This is meant to bias the agent toward:
-- **short read-only commands** for query tasks,
-- **minimal state changes + verification** for state tasks,
-- **implement -> verify -> answer** for hybrid tasks.
-
-#### C. Conditional working-plan injection
-
-Earlier monitor versions injected a plan too often, which sometimes improved robustness but also increased token cost and over-constrained the agent.
-
-The current version only injects `[WORKING PLAN]` conditionally, mainly when:
-- the latest step failed,
-- the latest step changed state but still needs verification,
-- the agent recently triggered a monitor intervention,
-- or the trajectory looks suspicious.
-
-This reduced prompt overhead and made the monitor much less intrusive.
-
-#### D. Loop / stall detection
-
-The monitor keeps a short trajectory state and checks for:
-- repeated commands with nearly identical outputs,
-- suspicious empty inspection steps,
-- repeated low-signal behavior over a short window.
-
-When needed, it injects a recovery prompt that is aware of:
-- the current task mode,
-- the inferred failure type,
-- the remaining subgoal.
-
-#### E. Oversized-bash guard
-
-A new pre-execution guard blocks **large multi-line bash scripts** in situations where they are usually harmful:
-- query tasks,
-- hybrid tasks in diagnose / answer phases,
-- state tasks during early diagnosis.
-
-Instead of allowing a large brittle script, the monitor tells the model to:
-- narrow with one short command first,
-- avoid large pipelines unless the task explicitly requires creating a script/file.
-
-#### F. Commit / answer gating
-
-The monitor blocks:
-- `finish_action` on answer-style tasks,
-- finishing without verification on state tasks,
-- finishing hybrid tasks before the final output is grounded.
-
-This helps enforce:
-- **state tasks**: mutate -> verify -> finish
-- **answer tasks**: observe -> answer
-- **hybrid tasks**: implement -> verify -> answer / finish
-
-#### G. Protocol-safe tool handling
-
-In `src/server/tasks/os_interaction/task.py`, tool handling was tightened so that:
-- assistant tool calls are always followed by tool responses in the proper order,
-- extra tool calls in the same turn are explicitly handled,
-- plain-text atomic answers can be auto-converted into an answer result in limited cases,
-- bash execution failures are wrapped and surfaced more safely.
-
-This reduced model/protocol errors substantially in the latest run.
-
----
-
-## 5) Files changed for the monitored variant
-
-The main files involved in the current monitor-assisted pipeline are:
-
-- `src/server/tasks/os_interaction/monitoring.py`
-- `src/server/tasks/os_interaction/task.py`
-- `configs/tasks/os.yaml`
-
-At a high level:
-
-- **`monitoring.py`**
-  - trajectory state
-  - task typing (`answer` / `state` / `hybrid`)
-  - loop/stall detection
-  - working-plan generation
-  - recovery prompt generation
-  - commit/answer gating
-  - oversized-bash guard
-
-- **`task.py`**
-  - inject initial task hint
-  - inject working plan only when needed
-  - process tool calls safely
-  - record shell execution into trajectory state
-  - auto-handle some grounded atomic answers
-
-- **`os.yaml`**
-  - keeps the original `os-std`
-  - adds the monitored variant `os-std-monitor-replan`
-  - uses a lighter monitor config:
-    - `round_limit: 14`
-    - `max_interventions: 2`
-    - `cooldown_rounds: 2`
-
----
-
-## 6) Running the latest monitored variant
-
-After code changes, rebuild the OS-only stack:
-
-```bash
-docker compose -f extra/docker-compose.os-only.yml down
-docker compose -f extra/docker-compose.os-only.yml up --build -d
-```
-
-Small smoke test:
+Baseline:
 
 ```bash
 agentrl-eval \
@@ -334,14 +250,13 @@ agentrl-eval \
   -c http://localhost:5020/api \
   -u https://api.openai.com/v1 \
   -m gpt-5-mini \
-  --indices-range "0-19" \
-  --concurrency 1 \
+  --concurrency 4 \
   -n 1 \
   -o results \
-  os-std-monitor-replan
+  os-std
 ```
 
-Full run:
+Monitor-replan:
 
 ```bash
 agentrl-eval \
@@ -355,111 +270,164 @@ agentrl-eval \
   os-std-monitor-replan
 ```
 
----
+### HORIZON-style safe subset
 
-## 7) Latest experimental results
+Baseline:
 
-### Baseline reproduction
+```bash
+agentrl-eval \
+  --no-interactive \
+  -c http://localhost:5020/api \
+  -u https://api.openai.com/v1 \
+  -m gpt-5-mini \
+  --concurrency 4 \
+  -n 1 \
+  -o results/horizon_baseline \
+  os-horizon-all
+```
 
-Initial CSL reproduction:
+Monitor-replan:
 
-- **gpt-5.1**: SR ≈ **38.8%**
-- **gpt-5-mini**: SR ≈ **28.7%**
+```bash
+agentrl-eval \
+  --no-interactive \
+  -c http://localhost:5020/api \
+  -u https://api.openai.com/v1 \
+  -m gpt-5-mini \
+  --concurrency 4 \
+  -n 1 \
+  -o results/horizon_monitor \
+  os-horizon-all-monitor-replan
+```
 
-### Intermediate monitored version
+Run a single tier:
 
-A later monitor-assisted version (full 144-task run) with **gpt-5-mini** produced:
-
-- **valid-task success rate**: **38.46%** (`55 / 143`)
-- **overall end-to-end success rate**: **38.19%** (`55 / 144`)
-- **non-completed samples**:
-  - `1` server error
-  - `1` task limit reached
-
-Token usage from `run.log`:
-
-- **1.6M tokens total**
-  - 1.2M input
-  - 437.3k output
-  - 349.6k thinking
-
-### Latest monitored version
-
-The latest full run of `os-std-monitor-replan` with **gpt-5-mini** produced:
-
-- **valid-task success rate**: **50.35%** (`72 / 143`)
-- **overall end-to-end success rate**: **50.00%** (`72 / 144`)
-- **non-completed samples**:
-  - `1` server error
-  - `0` task errors
-  - `0` model errors
-  - `0` task-limit failures
-
-Token usage from `run.log`:
-
-- **833.7k tokens total**
-  - 593.7k input
-  - 240.1k output
-  - 201.3k thinking
-
-### Why both numbers are reported
-
-`agentrl-eval` reports a **valid-task average**, which excludes some failed runs that do not complete in the standard way (for example, server-side errors).  
-For transparency, we also report the **overall end-to-end success rate over all 144 tasks**.
-
-In the latest run:
-
-- evaluator-reported valid average: **50.35%**
-- true full-run success over all 144 tasks: **50.00%**
+```bash
+agentrl-eval \
+  --no-interactive \
+  -c http://localhost:5020/api \
+  -u https://api.openai.com/v1 \
+  -m gpt-5-mini \
+  --concurrency 2 \
+  -n 1 \
+  -o results/horizon_cf10_baseline \
+  os-horizon-cf10
+```
 
 ---
 
-## 8) Observations from the latest traces
+## Optional: Gemini / Vertex AI runs
 
-From the recent trace analysis, the biggest improvements appear to come from:
+The Gemini experiments were run through Vertex AI's OpenAI-compatible endpoint.  Because `agentrl-eval` uses an OpenAI-style client, the Google OAuth access token is passed through the `OPENAI_API_KEY` environment variable.
 
-- **better task-type routing**
-  - query tasks are less likely to be pushed into unnecessary mutations
-- **less monitor over-injection**
-  - trajectories are shorter and cleaner
-- **safer tool-call handling**
-  - protocol-related model errors were largely eliminated
-- **blocking oversized scripts**
-  - the agent is nudged toward short, local evidence-gathering steps
+```bash
+export PROJECT_ID="YOUR_GCP_PROJECT"
+export LOCATION="global"
+export VERTEX_OPENAI_BASE_URL="https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/endpoints/openapi"
+export OPENAI_API_KEY="$(gcloud auth print-access-token)"
 
-A useful side effect is **lower token usage**:
-- the latest run achieved a much higher success rate than the intermediate monitor version,
-- while using **roughly half** as many total tokens.
+agentrl-eval \
+  --no-interactive \
+  -c http://localhost:5020/api \
+  -u "$VERTEX_OPENAI_BASE_URL" \
+  -m google/gemini-3-flash-preview \
+  --concurrency 2 \
+  -n 1 \
+  -o results/gemini3_flash_os_std \
+  os-std
+```
 
----
-
-## 9) Remaining known issue
-
-There is still **one persistent server error** in the latest full run.
-
-Observed symptom:
-- an `InteractResponse` validation error indicating that the response `messages` field was empty
-
-This issue does **not** look like a general monitor/protocol failure, because:
-- it appears only once,
-- it also appeared in an earlier monitored run,
-- and the broader protocol-error pattern disappeared in the latest version.
-
-So the current working hypothesis is that this is a **sample-specific controller/session edge case**, rather than the main algorithmic bottleneck.
+The access token from `gcloud auth print-access-token` is short-lived.  For long overnight runs, split evaluation by index ranges and refresh the token before each segment.
 
 ---
 
-## 10) Current takeaway
+## Results
 
-At this point, the monitor-assisted variant is no longer just a minor scaffold around the baseline.  
-It functions as a lightweight **trajectory controller** for long-horizon OS tasks:
+### Original AgentBench OS: 144 tasks
 
-- infer task type,
-- encourage short grounded evidence gathering,
-- block oversized low-value actions,
-- prevent premature finish/answer,
-- and recover from loops or weak-signal behavior.
+| Model | Baseline | w/ Monitor | Gain |
+|---|---:|---:|---:|
+| GPT-5-mini | 28.7% | 50.3% | +21.6 pts |
+| GPT-5.4 | 48.6% | 56.2% | +7.6 pts |
+| GPT-5.4-pro | 48.6% | 50.0% | +1.4 pts |
+| Gemini 3 Flash | 24.3% | 36.1% | +11.8 pts |
+| Gemini 3.1 Pro | 45.1% | 55.6% | +10.4 pts |
 
-On the latest full run with **gpt-5-mini**, this improved the project from the original **28.7%** baseline to about **50% overall**, while also reducing protocol/task errors and lowering token usage.
+Takeaway: the monitor improves every tested model on the original benchmark.  The largest absolute gain is on GPT-5-mini, suggesting that the monitor helps most when the base model is weaker.
 
-This is still a preliminary course-project result, but it is a strong signal that **lightweight inference-time trajectory control** can substantially improve long-horizon OS-agent robustness without any RL training.
+### HORIZON-style safe subset: 146 tasks
+
+| Model | Baseline | w/ Monitor | Gain |
+|---|---:|---:|---:|
+| GPT-5-mini | 50.0% | 85.6% | +35.6 pts |
+| Gemini 3 Flash | 42.5% | 67.8% | +25.3 pts |
+| Gemini 3.1 Pro | 76.7% | 92.5% | +15.8 pts |
+
+Takeaway: monitor-replan improves all three models on long-horizon tasks.  Gains are largest for weaker or mid-tier models, but even Gemini 3.1 Pro improves substantially.
+
+### Tier-wise HORIZON results
+
+Each value is success rate on that tier.  `cf0` has 46 tasks; `cf1`-`cf10` have 10 tasks each, so tier-level fluctuations should be interpreted cautiously.
+
+| Tier | GPT-5-mini Base | GPT-5-mini Mon | Gemini Flash Base | Gemini Flash Mon | Gemini 3.1 Pro Base | Gemini 3.1 Pro Mon |
+|---|---:|---:|---:|---:|---:|---:|
+| cf0 | 69.6% | 76.1% | 65.2% | 69.6% | 84.8% | 87.0% |
+| cf1 | 70.0% | 90.0% | 40.0% | 80.0% | 100.0% | 100.0% |
+| cf2 | 40.0% | 90.0% | 40.0% | 80.0% | 80.0% | 100.0% |
+| cf3 | 30.0% | 100.0% | 30.0% | 90.0% | 60.0% | 90.0% |
+| cf4 | 30.0% | 80.0% | 40.0% | 50.0% | 70.0% | 90.0% |
+| cf5 | 40.0% | 90.0% | 60.0% | 80.0% | 70.0% | 100.0% |
+| cf6 | 50.0% | 100.0% | 0.0% | 70.0% | 50.0% | 100.0% |
+| cf7 | 30.0% | 100.0% | 20.0% | 50.0% | 70.0% | 100.0% |
+| cf8 | 40.0% | 90.0% | 50.0% | 70.0% | 100.0% | 80.0% |
+| cf9 | 40.0% | 80.0% | 10.0% | 60.0% | 70.0% | 100.0% |
+| cf10 | 40.0% | 80.0% | 30.0% | 40.0% | 60.0% | 90.0% |
+
+---
+
+## Failure reason analysis
+
+We also analyzed original AgentBench OS failures using a HORIZON-style failure taxonomy.
+
+Key observations:
+
+- **Planning errors decrease with the monitor.**  Planning error drops for all OpenAI models in the failure-reason analysis: GPT-5-mini drops from roughly 34% to 22%, GPT-5.4 from 19% to 7%, and GPT-5.4-pro from 13% to 6%.
+- **Ill-defined instructions remain a bottleneck.**  Stronger models fail less from execution/planning issues and more from ambiguous task interpretation, which the current monitor does not fully solve.
+- **Stronger models fail differently.**  For weaker models, the monitor mainly reduces execution and planning drift.  For stronger models, the remaining failures are more often tied to task ambiguity or benchmark wording.
+
+---
+
+## Output format
+
+Each `agentrl-eval` run writes a timestamped directory under the specified output directory.  Typical contents include:
+
+```text
+results/<run-name>/
+  run.log
+  results.jsonl
+  <index>-<run>-<session>-<timestamp>/trace.json
+```
+
+For monitor-replan runs, traces may include injected monitor messages such as:
+
+- initial task-mode hints,
+- `[WORKING PLAN]`,
+- `[Monitor]` recovery prompts,
+- commit-gate messages.
+
+---
+
+## Limitations
+
+- The monitor is heuristic and hand-designed.  It does not learn when to intervene.
+- Task-mode inference and trajectory-risk detection are rule-based, not LLM-judged.
+- The HORIZON-style safe subset is not the official HORIZON OS evaluator.
+- The safe subset preserves final-task compatibility with AgentBench evaluation, but does not fully oracle-check all HORIZON-added intermediate constraints.
+- `cf1`-`cf10` each contain only 10 tasks, so per-tier success rates have high variance.
+- Some failures still require deeper long-horizon replanning than a lightweight prompt-layer monitor can provide.
+
+---
+
+## Current takeaway
+
+Monitor-replan acts as a lightweight trajectory controller for OS agents.  It improves standard AgentBench OS performance across all tested models and gives larger gains on the HORIZON-style long-horizon safe subset.  The main contribution is not a new base model, but a targeted inference-time control layer that keeps the agent grounded, phase-aware, and less likely to finish or answer without evidence.
