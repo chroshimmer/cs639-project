@@ -16,6 +16,8 @@ This summary covers the three full runs currently retained in `extension1_cycle_
 | extension1 (`os-std-extension1`) | 144 | 142 | 56 | 0.3944 |
 | combo v2 (`os-std-combo`) | 144 | 140 | 68 | 0.4857 |
 
+**Four-way comparison (monitor-replan):** not stored under `extension1_cycle_recovery/results/`. From the main repo run `results/gpt-5-mini-os-std-monitor-replan-202604070041/`: completed-only success rate tracks **72/143 ≈ 50.35%** (same convention as `results.jsonl` aggregated rows in the Extension~1 report §5.1).
+
 ## 3) Status breakdown
 
 - Baseline (`os-std-202605031258`)

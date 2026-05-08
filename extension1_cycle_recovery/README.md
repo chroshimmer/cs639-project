@@ -25,6 +25,8 @@ Think of this folder as:
 - a reproducibility helper;
 - a "drop-in reference" for which files were modified.
 
+**Integration note (important):** `cycle_monitor.py` lives **here**, under `extension1_cycle_recovery/src/...`. In many checkouts the **repository root** `src/server/tasks/os_interaction/` does **not** ship Extension~1 by default (no `cycle_monitor.py` until you copy from this bundle per §4). Running `os-std-extension1` / `os-std-combo` requires those overlays.
+
 ---
 
 ## 2) What is included in this package
@@ -35,12 +37,14 @@ Current mirrored content includes:
 - `src/server/tasks/os_interaction/task.py`
 - `src/server/tasks/os_interaction/cycle_monitor.py`
 - `reports/Extension 1 – State-Aware Cycle Detection & Recovery.md`
-- selected run scripts (`run_*.sh`)
 - selected full-run result folders under `results/...`:
   - `gpt-5-mini-os-std-202605031258` (baseline)
   - `gpt-5-mini-os-std-extension1-202605031322` (extension1)
   - `gpt-5-mini-os-std-combo-202605031445` (combo v2)
-- copied `tests/` directory
+- run helpers: `run_combo.sh`, `run_ab.sh`, `run_full_ab.sh`
+- `tests/test_cycle_monitor.py` (unit tests for cycle scoring / intervention logic)
+
+**Not bundled here (large / separate run):** the full `gpt-5-mini` **monitor-replan** directory used for four-way comparisons in the Extension~1 report lives under the **main repo** at `results/gpt-5-mini-os-std-monitor-replan-202604070041/` (April batch). Copy it in if you want a single folder that holds all four raw runs.
 
 These paths are preserved under `extension1_cycle_recovery/` to make diffing and restoration simple.
 
@@ -151,7 +155,7 @@ Optional documentation replacement:
 
 Optional scripts/logs/results:
 
-- Copy from `extension1_cycle_recovery/run_*.sh` and `extension1_cycle_recovery/results/...` as needed.
+- Copy from `extension1_cycle_recovery/run_combo.sh`, `run_ab.sh`, `run_full_ab.sh`, and `extension1_cycle_recovery/results/...` as needed.
 - For GitHub hygiene, prefer uploading summarized reports over full raw traces.
 
 ---
@@ -174,5 +178,6 @@ Then do:
 ## 6) Notes
 
 - This package stores copied artifacts; the canonical runnable project remains the root repository.
+- Before grading or external review, **diff** `extension1_cycle_recovery/src/...` and `configs/...` against the repo root and refresh copies if the main branch moved (avoid stale mirrors).
 - Keep filenames with spaces/special dash quoted in shell commands, e.g.:
   - `"reports/Extension 1 – State-Aware Cycle Detection & Recovery.md"`
